@@ -1,0 +1,127 @@
+package netadapter
+
+import (
+	"fmt"
+	"sync/atomic"
+
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	routerpkg "github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/router"
+	"github.com/pkg/errors"
+
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/id"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/server"
+)
+
+// NetConnection is a wrapper to a server connection for use by services external to NetAdapter
+type NetConnection struct {
+	connection            server.Connection
+	id                    *id.ID
+	router                *routerpkg.Router
+	onDisconnectedHandler server.OnDisconnectedHandler
+	isRouterClosed        atomic.Uint32
+	shouldBanCounter      uint32
+	ErrorMessage          error
+}
+
+func newNetConnection(connection server.Connection, routerInitializer RouterInitializer, name string, router *routerpkg.Router) *NetConnection {
+	if router == nil {
+		router = routerpkg.NewRouter(name)
+	}
+
+	netConnection := &NetConnection{
+		connection:       connection,
+		router:           router,
+		shouldBanCounter: 0,
+		ErrorMessage:     nil,
+	}
+
+	netConnection.connection.SetOnDisconnectedHandler(func() {
+		log.Debugf("Disconnected from %s", netConnection)
+		// If the disconnection came because of a network error and not because of the application layer, we
+		// need to close the router as well.
+		if netConnection.isRouterClosed.Add(1) == 1 {
+			netConnection.router.Close()
+		}
+		// Call the onDisconnectedHandler if it was set by the caller. It may be nil
+		// if the underlying connection disconnected before the caller had a chance
+		// to set it (race between connection lifecycle and handler setup).
+		if netConnection.onDisconnectedHandler != nil {
+			netConnection.onDisconnectedHandler()
+		}
+	})
+
+	routerInitializer(router, netConnection)
+
+	return netConnection
+}
+
+func (c *NetConnection) start() {
+	if c.onDisconnectedHandler == nil {
+		panic(errors.New("onDisconnectedHandler is nil"))
+	}
+
+	c.connection.Start(c.router)
+}
+
+func (c *NetConnection) String() string {
+	return fmt.Sprintf("<%s: %s>", c.id, c.connection)
+}
+
+// ID returns the ID associated with this connection
+func (c *NetConnection) ID() *id.ID {
+	return c.id
+}
+
+// SetID sets the ID associated with this connection
+func (c *NetConnection) SetID(peerID *id.ID) {
+	c.id = peerID
+}
+
+// Address returns the address associated with this connection
+func (c *NetConnection) Address() string {
+	return c.connection.Address().String()
+}
+
+// IsOutbound returns whether the connection is outbound
+func (c *NetConnection) IsOutbound() bool {
+	return c.connection.IsOutbound()
+}
+
+// NetAddress returns the NetAddress associated with this connection
+func (c *NetConnection) NetAddress() *appmessage.NetAddress {
+	return appmessage.NewNetAddress(c.connection.Address())
+}
+
+func (c *NetConnection) setOnDisconnectedHandler(onDisconnectedHandler server.OnDisconnectedHandler) {
+	c.onDisconnectedHandler = onDisconnectedHandler
+}
+
+// SetOnDisconnectedHandler sets the handler run when this connection disconnects at the transport
+// level - the same handler the internal onDisconnectedHandler field drives, exported so a
+// RouterInitializer (which runs in a different package, before the connected-handler that normally
+// installs this) can register its own cleanup. Overwrites whatever was set before, so call it at
+// most once per connection.
+func (c *NetConnection) SetOnDisconnectedHandler(onDisconnectedHandler server.OnDisconnectedHandler) {
+	c.setOnDisconnectedHandler(onDisconnectedHandler)
+}
+
+// Disconnect disconnects the given connection
+func (c *NetConnection) Disconnect() {
+	if c.isRouterClosed.Add(1) == 1 {
+		c.router.Close()
+	}
+	c.connection.Disconnect()
+}
+
+// SetOnInvalidMessageHandler sets the invalid message handler for this connection
+func (c *NetConnection) SetOnInvalidMessageHandler(onInvalidMessageHandler server.OnInvalidMessageHandler) {
+	c.connection.SetOnInvalidMessageHandler(onInvalidMessageHandler)
+}
+
+func (c *NetConnection) ShouldWeBan(banLimit uint32) bool {
+	if c.shouldBanCounter > banLimit {
+		return true
+	}
+	c.shouldBanCounter++
+	return false
+}

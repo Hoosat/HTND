@@ -1,0 +1,324 @@
+package mempool
+
+import (
+	"time"
+
+	"github.com/pkg/errors"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+	"github.com/HoosatNetwork/HTND/v2/domain/miningmanager/mempool/model"
+)
+
+type transactionsPool struct {
+	mempool                       *mempool
+	allTransactions               model.IDToTransactionMap
+	highPriorityTransactions      model.IDToTransactionMap
+	chainedTransactionsByParentID model.IDToTransactionsSliceMap
+	transactionsOrderedByFeeRate  model.TransactionsOrderedByFeeRate
+	lastExpireScanDAAScore        uint64
+	lastExpireScanTime            time.Time
+}
+
+func newTransactionsPool(mp *mempool) *transactionsPool {
+	return &transactionsPool{
+		mempool:                       mp,
+		allTransactions:               model.IDToTransactionMap{},
+		highPriorityTransactions:      model.IDToTransactionMap{},
+		chainedTransactionsByParentID: model.IDToTransactionsSliceMap{},
+		transactionsOrderedByFeeRate:  model.TransactionsOrderedByFeeRate{},
+		lastExpireScanDAAScore:        0,
+		lastExpireScanTime:            time.Now(),
+	}
+}
+
+func (tp *transactionsPool) addTransaction(transaction *externalapi.DomainTransaction,
+	parentTransactionsInPool model.IDToTransactionMap, isHighPriority bool,
+) (*model.MempoolTransaction, error) {
+	virtualDAAScore, err := tp.mempool.consensusReference.Consensus().GetVirtualDAAScore()
+	if err != nil {
+		return nil, err
+	}
+
+	mempoolTransaction := model.NewMempoolTransaction(
+		transaction, parentTransactionsInPool, isHighPriority, virtualDAAScore)
+
+	err = tp.addMempoolTransaction(mempoolTransaction)
+	if err != nil {
+		return nil, err
+	}
+
+	return mempoolTransaction, nil
+}
+
+func (tp *transactionsPool) addMempoolTransaction(transaction *model.MempoolTransaction) error {
+	tp.allTransactions[*transaction.TransactionID()] = transaction
+
+	for _, parentTransactionInPool := range transaction.ParentTransactionsInPool() {
+		parentTransactionID := *parentTransactionInPool.TransactionID()
+		if tp.chainedTransactionsByParentID[parentTransactionID] == nil {
+			tp.chainedTransactionsByParentID[parentTransactionID] = []*model.MempoolTransaction{}
+		}
+		tp.chainedTransactionsByParentID[parentTransactionID] = append(tp.chainedTransactionsByParentID[parentTransactionID], transaction)
+	}
+
+	tp.mempool.mempoolUTXOSet.addTransaction(transaction)
+
+	err := tp.transactionsOrderedByFeeRate.Push(transaction)
+	if err != nil {
+		return err
+	}
+
+	if transaction.IsHighPriority() {
+		tp.highPriorityTransactions[*transaction.TransactionID()] = transaction
+	}
+
+	return nil
+}
+
+// removeFromChainedList removes the child transaction from the parent's chainedTransactionsByParentID slice.
+// It cleans up empty parent entries.
+func (tp *transactionsPool) removeFromChainedList(parentID externalapi.DomainTransactionID, child *model.MempoolTransaction) {
+	children, ok := tp.chainedTransactionsByParentID[parentID]
+	if !ok {
+		return
+	}
+
+	for i, c := range children {
+		if c == child {
+			// Remove by swapping with last element + truncate (order doesn't matter for this map)
+			lastIdx := len(children) - 1
+			children[i] = children[lastIdx]
+			tp.chainedTransactionsByParentID[parentID] = children[:lastIdx]
+
+			if len(tp.chainedTransactionsByParentID[parentID]) == 0 {
+				delete(tp.chainedTransactionsByParentID, parentID)
+			}
+			return
+		}
+	}
+}
+
+func (tp *transactionsPool) removeTransaction(transaction *model.MempoolTransaction) error {
+	// Clean up this transaction's pointer from all of its parents' chained lists.
+	// This fixes the memory leak where removed children stayed referenced forever.
+	for _, parent := range transaction.ParentTransactionsInPool() {
+		parentID := *parent.TransactionID()
+		tp.removeFromChainedList(parentID, transaction)
+	}
+
+	delete(tp.allTransactions, *transaction.TransactionID())
+
+	err := tp.transactionsOrderedByFeeRate.Remove(transaction)
+	if err != nil {
+		if errors.Is(err, model.ErrTransactionNotFound) {
+			log.Debugf("Transaction %s not found in tp.transactionsOrderedByFeeRate. This should never happen but sometime does",
+				transaction.TransactionID())
+		} else {
+			return err
+		}
+	}
+
+	delete(tp.highPriorityTransactions, *transaction.TransactionID())
+
+	// This removes the entry for *this* transaction acting as a parent (its own children list).
+	delete(tp.chainedTransactionsByParentID, *transaction.TransactionID())
+
+	return nil
+}
+
+func (tp *transactionsPool) expireOldTransactions() error {
+	virtualDAAScore, err := tp.mempool.consensusReference.Consensus().GetVirtualDAAScore()
+	if err != nil {
+		return err
+	}
+
+	if virtualDAAScore-tp.lastExpireScanDAAScore < tp.mempool.config.transactionExpireScanIntervalDAAScore() ||
+		time.Since(tp.lastExpireScanTime).Seconds() < float64(tp.mempool.config.TransactionExpireScanIntervalSeconds) {
+		return nil
+	}
+
+	expired := 0
+	for _, mempoolTransaction := range tp.allTransactions {
+		// Never expire high priority transactions
+		if mempoolTransaction.IsHighPriority() {
+			continue
+		}
+
+		// Remove all transactions whose addedAtDAAScore is older then TransactionExpireIntervalDAAScore
+		daaScoreSinceAdded := virtualDAAScore - mempoolTransaction.AddedAtDAAScore()
+		if daaScoreSinceAdded > tp.mempool.config.transactionExpireIntervalDAAScore() {
+			log.Debugf("Removing transaction %s, because it expired. DAAScore moved by %d, expire interval: %d",
+				mempoolTransaction.TransactionID(), daaScoreSinceAdded, tp.mempool.config.transactionExpireIntervalDAAScore())
+			expired++
+			err = tp.mempool.removeTransaction(mempoolTransaction.TransactionID(), true)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// Reported per scan rather than per transaction, so the count stays readable when a stalled
+	// network expires a whole mempool at once. A relayed transaction that expires was never mined,
+	// and expiry takes its redeemers with it - so a chain of dependent transactions leaves together
+	// and every node then answers not-found for all of them. That is worth one line at info.
+	if expired > 0 {
+		log.Infof("Expired %d transaction(s) from the mempool: they were not mined within %d DAA "+
+			"score of being added. Dependent transactions were removed with them",
+			expired, tp.mempool.config.transactionExpireIntervalDAAScore())
+	}
+
+	tp.lastExpireScanDAAScore = virtualDAAScore
+	tp.lastExpireScanTime = time.Now()
+	return nil
+}
+
+func (tp *transactionsPool) allReadyTransactions() []*externalapi.DomainTransaction {
+	result := make([]*externalapi.DomainTransaction, len(tp.allTransactions))
+	resultCount := 0
+
+	for _, mempoolTransaction := range tp.allTransactions {
+		if len(mempoolTransaction.ParentTransactionsInPool()) == 0 {
+			result[resultCount] = mempoolTransaction.Transaction().Clone() // this pointer leaves the mempool, and gets its utxo set to nil, hence we clone.
+			resultCount++
+		}
+	}
+
+	return result[:resultCount]
+}
+
+func (tp *transactionsPool) getParentTransactionsInPool(
+	transaction *externalapi.DomainTransaction,
+) model.IDToTransactionMap {
+	parentsTransactionsInPool := model.IDToTransactionMap{}
+
+	for _, input := range transaction.Inputs {
+		if transaction, ok := tp.allTransactions[input.PreviousOutpoint.TransactionID]; ok {
+			parentsTransactionsInPool[*transaction.TransactionID()] = transaction
+		}
+	}
+
+	return parentsTransactionsInPool
+}
+
+// getRedeemers returns every in-pool descendant of transaction, each exactly once.
+//
+// A transaction spending outputs of two siblings is a child of both, so without the visited set it
+// was reached once per path: each such diamond doubled the walk below it, making it exponential in
+// chain length while holding the mempool lock, and callers removed the same transaction repeatedly.
+func (tp *transactionsPool) getRedeemers(transaction *model.MempoolTransaction) []*model.MempoolTransaction {
+	stack := []*model.MempoolTransaction{transaction}
+	redeemers := []*model.MempoolTransaction{}
+	visited := map[externalapi.DomainTransactionID]struct{}{*transaction.TransactionID(): {}}
+	for len(stack) > 0 {
+		var current *model.MempoolTransaction
+		last := len(stack) - 1
+		current, stack = stack[last], stack[:last]
+
+		for _, redeemerTransaction := range tp.chainedTransactionsByParentID[*current.TransactionID()] {
+			redeemerID := *redeemerTransaction.TransactionID()
+			if _, ok := visited[redeemerID]; ok {
+				continue
+			}
+			visited[redeemerID] = struct{}{}
+			stack = append(stack, redeemerTransaction)
+			redeemers = append(redeemers, redeemerTransaction)
+		}
+	}
+	return redeemers
+}
+
+func (tp *transactionsPool) limitTransactionCount() error {
+	currentIndex := 0
+
+	for uint64(len(tp.allTransactions)) > tp.mempool.config.MaximumTransactionCount {
+		var transactionToRemove *model.MempoolTransaction
+		for {
+			transactionToRemove = tp.transactionsOrderedByFeeRate.GetByIndex(currentIndex)
+			if transactionToRemove == nil {
+				// transactionsOrderedByFeeRate can hold fewer entries than allTransactions (see
+				// addMempoolTransaction's unrolled-back Push failure and removeTransaction's tolerated
+				// ErrTransactionNotFound) - ran out of ordered entries before finding one to evict.
+				log.Warnf(
+					"transactionsOrderedByFeeRate ran out of entries at index %d while evicting "+
+						"(mempool count %d, maximum allowed %d) - it may be out of sync with the pool",
+					currentIndex, len(tp.allTransactions), tp.mempool.config.MaximumTransactionCount)
+				return nil
+			}
+			if !transactionToRemove.IsHighPriority() {
+				break
+			}
+			currentIndex++
+			if currentIndex >= len(tp.allTransactions) {
+				log.Warnf(
+					"Number of high-priority transactions in mempool (%d) is higher than maximum allowed (%d)",
+					len(tp.allTransactions), tp.mempool.config.MaximumTransactionCount)
+				return nil
+			}
+		}
+
+		log.Debugf("Removing transaction %s, because mempoolTransaction count (%d) exceeded the limit (%d)",
+			transactionToRemove.TransactionID(), len(tp.allTransactions), tp.mempool.config.MaximumTransactionCount)
+		err := tp.mempool.removeTransaction(transactionToRemove.TransactionID(), true)
+		if err != nil {
+			return err
+		}
+		if currentIndex >= len(tp.allTransactions) {
+			break
+		}
+	}
+	return nil
+}
+
+func (tp *transactionsPool) getTransaction(transactionID *externalapi.DomainTransactionID, clone bool) (*externalapi.DomainTransaction, bool) {
+	if mempoolTransaction, ok := tp.allTransactions[*transactionID]; ok {
+		if clone {
+			return mempoolTransaction.Transaction().Clone(), true // this pointer leaves the mempool, hence we clone.
+		}
+		return mempoolTransaction.Transaction(), true
+	}
+	return nil, false
+}
+
+func (tp *transactionsPool) getTransactionsByAddresses(clone bool) (
+	sending model.ScriptPublicKeyStringToDomainTransactions,
+	receiving model.ScriptPublicKeyStringToDomainTransactions,
+	err error,
+) {
+	sending = make(model.ScriptPublicKeyStringToDomainTransactions, tp.transactionCount())
+	receiving = make(model.ScriptPublicKeyStringToDomainTransactions, tp.transactionCount())
+	var transaction *externalapi.DomainTransaction
+	for _, mempoolTransaction := range tp.allTransactions {
+		transaction = mempoolTransaction.Transaction()
+		if clone {
+			transaction = transaction.Clone() // this pointer leaves the mempool, hence we clone.
+		}
+		for _, input := range transaction.Inputs {
+			if input.UTXOEntry == nil {
+				return nil, nil, errors.Errorf("Mempool transaction %s is missing an UTXOEntry. This should be fixed, and not happen", consensushashing.TransactionID(transaction).String())
+			}
+			sending.Add(input.UTXOEntry.ScriptPublicKey().String(), transaction)
+		}
+		for _, output := range transaction.Outputs {
+			receiving.Add(output.ScriptPublicKey.String(), transaction)
+		}
+	}
+	return sending, receiving, nil
+}
+
+func (tp *transactionsPool) getAllTransactions(clone bool) []*externalapi.DomainTransaction {
+	allTransactions := make([]*externalapi.DomainTransaction, len(tp.allTransactions))
+	i := 0
+	for _, mempoolTransaction := range tp.allTransactions {
+		allTransactions[i] = mempoolTransaction.Transaction()
+		if clone {
+			allTransactions[i] = allTransactions[i].Clone() // this pointer leaves the mempool, hence we clone.
+		}
+		i++
+	}
+	return allTransactions
+}
+
+func (tp *transactionsPool) transactionCount() int {
+	return len(tp.allTransactions)
+}

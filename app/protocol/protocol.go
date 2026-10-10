@@ -1,0 +1,287 @@
+package protocol
+
+import (
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/common"
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/flows/ready"
+	v8 "github.com/HoosatNetwork/HTND/v2/app/protocol/flows/v8"
+
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/flows/handshake"
+	peerpkg "github.com/HoosatNetwork/HTND/v2/app/protocol/peer"
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/protocolerrors"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/addressmanager"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/connmanager"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter"
+	routerpkg "github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/router"
+	"github.com/pkg/errors"
+)
+
+var (
+	bannedKnockMu    sync.Mutex
+	bannedKnockLast  = map[string]time.Time{}
+	bannedKnockCount atomic.Uint64
+)
+
+// noteBannedKnock counts a reconnect from an already-banned address and
+// reports whether this one should be logged. The first knock and one per ten
+// minutes are logged. The rest are counted for the status line.
+func noteBannedKnock(ip string) bool {
+	bannedKnockCount.Add(1)
+	bannedKnockMu.Lock()
+	defer bannedKnockMu.Unlock()
+	now := time.Now()
+	if last, ok := bannedKnockLast[ip]; ok && now.Sub(last) < 10*time.Minute {
+		return false
+	}
+	bannedKnockLast[ip] = now
+	return true
+}
+
+func (m *Manager) routerInitializer(router *routerpkg.Router, netConnection *netadapter.NetConnection) {
+	// isStopping flag is raised the moment that the connection associated with this router is disconnected
+	// errChan is used by the flow goroutines to return to runFlows when an error occurs.
+	// They are both initialized here and passed to register flows.
+	isStopping := uint32(0)
+	errChan := make(chan error, 100)
+
+	receiveVersionRoute, sendVersionRoute, receiveReadyRoute := registerHandshakeRoutes(router)
+
+	// After flows were registered - spawn a new thread that will wait for connection to finish initializing
+	// and start receiving messages
+	spawn("routerInitializer-runFlows", func() {
+		m.routersWaitGroup.Add(1)
+		defer m.routersWaitGroup.Done()
+
+		if m.isClosed.Load() == 1 {
+			panic(errors.Errorf("tried to initialize router when the protocol manager is closed"))
+		}
+		log.Debugf("initializing route for %s", netConnection)
+		isBanned, err := m.context.ConnectionManager().IsBanned(netConnection)
+		if err != nil && !errors.Is(err, addressmanager.ErrAddressNotFound) {
+			m.handleError(err, netConnection, router.OutgoingRoute())
+			return
+		}
+		if isBanned {
+			ip := ""
+			if addr := netConnection.NetAddress(); addr != nil && addr.IP != nil {
+				ip = addr.IP.String()
+			}
+			if noteBannedKnock(ip) {
+				log.Infof("banned peer %s knocked, disconnecting (further knocks from this address logged once per 10 minutes)", netConnection)
+			}
+			netConnection.Disconnect()
+			return
+		}
+
+		netConnection.SetOnInvalidMessageHandler(func(err error) {
+			if atomic.AddUint32(&isStopping, 1) == 1 {
+				errChan <- protocolerrors.Wrap(true, err, "received bad message")
+			}
+		})
+		log.Debugf("Doing Handshake with %s", netConnection)
+		peer, err := handshake.HandleHandshake(m.context, netConnection, receiveVersionRoute, sendVersionRoute, router.OutgoingRoute())
+		if err != nil {
+			// non-blocking read from channel
+			select {
+			case innerError := <-errChan:
+				if errors.Is(err, routerpkg.ErrRouteClosed) {
+					m.handleError(innerError, netConnection, router.OutgoingRoute())
+				} else {
+					log.Errorf("Peer %s sent invalid message: %s", netConnection, innerError)
+					m.handleError(err, netConnection, router.OutgoingRoute())
+				}
+			default:
+				m.handleError(err, netConnection, router.OutgoingRoute())
+			}
+			netConnection.ErrorMessage = err
+			return
+		}
+		defer m.context.RemoveFromPeers(peer)
+
+		var flows []*common.Flow
+		log.Debugf("Registering p2p flows for peer %s for protocol version %d", peer, peer.ProtocolVersion())
+		switch peer.ProtocolVersion() {
+		case 11:
+			flows = v8.Register(m, netConnection, router, errChan, &isStopping)
+		default:
+			err = protocolerrors.Errorf(false, "peer protocol version %d is not accepted", peer.ProtocolVersion())
+			m.handleError(err, netConnection, router.OutgoingRoute())
+			return
+		}
+		log.Debugf("Registered p2p flows for peer %s.", peer)
+
+		err = ready.HandleReady(receiveReadyRoute, router.OutgoingRoute(), peer)
+		if err != nil {
+			m.handleError(err, netConnection, router.OutgoingRoute())
+			return
+		}
+		log.Debugf("HandleReady for peer %s", peer)
+		removeHandshakeRoutes(router)
+
+		log.Debugf("Registered p2p flows and running them for peer %s", peer)
+		flowsWaitGroup := &sync.WaitGroup{}
+		err = m.runFlows(flows, peer, errChan, flowsWaitGroup)
+
+		if err != nil {
+			router.Close()
+			m.handleError(err, netConnection, router.OutgoingRoute())
+			flowsWaitGroup.Wait()
+			return
+		}
+
+		// Clean exit path
+		router.Close()
+		flowsWaitGroup.Wait()
+	})
+}
+
+func (m *Manager) handleError(err error, netConnection *netadapter.NetConnection, outgoingRoute *routerpkg.Route) {
+	netConnection.ErrorMessage = err
+	if protocolErr := (protocolerrors.ProtocolError{}); errors.As(err, &protocolErr) {
+		if m.context.Config().EnableBanning && protocolErr.ShouldBan {
+			log.Warnf("Banning %s (reason: %s)", netConnection, protocolErr.Cause)
+			err := m.context.ConnectionManager().Ban(netConnection)
+			if err != nil && !errors.Is(err, connmanager.ErrCannotBanPermanent) {
+				return
+			}
+			err = outgoingRoute.Enqueue(appmessage.NewMsgReject(protocolErr.Error()))
+			if err != nil && !errors.Is(err, routerpkg.ErrRouteClosed) {
+				return
+			}
+		}
+		log.Debugf("Disconnecting from %s (reason: %s)", netConnection, protocolErr.Cause)
+		netConnection.Disconnect()
+		return
+	}
+
+	if errors.Is(err, common.ErrHandshakeTimeout) {
+		log.Debugf("Handshake timed out for connection %v. Disconnecting..", netConnection)
+		netConnection.Disconnect()
+		return
+	}
+
+	if errors.Is(err, common.ErrPeerWithSameIDExists) {
+		log.Debugf("Peer already exists %v. Disconnecting..", netConnection)
+		netConnection.Disconnect()
+		return
+	}
+	if errors.Is(err, routerpkg.ErrTimeout) {
+		log.Debugf("Got timeout from %s. Disconnecting...", netConnection)
+		netConnection.Disconnect()
+		return
+	}
+	if errors.Is(err, routerpkg.ErrRouteClosed) {
+		log.Debugf("Route closed: %v", netConnection)
+		return
+	}
+	if errors.Is(err, addressmanager.ErrAddressNotFound) {
+		log.Debugf("Address not found: %v", netConnection)
+		return
+	}
+	panic(err)
+}
+
+// RegisterFlow registers a flow to the given router.
+func (m *Manager) RegisterFlow(name string, router *routerpkg.Router, messageTypes []appmessage.MessageCommand, isStopping *uint32,
+	errChan chan error, initializeFunc common.FlowInitializeFunc,
+) *common.Flow {
+	route, err := router.AddIncomingRoute(name, messageTypes)
+	if err != nil {
+		panic(err)
+	}
+
+	return m.registerFlowForRoute(route, name, isStopping, errChan, initializeFunc)
+}
+
+// RegisterFlowWithCapacity registers a flow to the given router with a custom capacity.
+func (m *Manager) RegisterFlowWithCapacity(name string, capacity int, router *routerpkg.Router,
+	messageTypes []appmessage.MessageCommand, isStopping *uint32,
+	errChan chan error, initializeFunc common.FlowInitializeFunc,
+) *common.Flow {
+	route, err := router.AddIncomingRouteWithCapacity(name, capacity, messageTypes)
+	if err != nil {
+		panic(err)
+	}
+
+	return m.registerFlowForRoute(route, name, isStopping, errChan, initializeFunc)
+}
+
+func (m *Manager) registerFlowForRoute(route *routerpkg.Route, name string, isStopping *uint32,
+	errChan chan error, initializeFunc common.FlowInitializeFunc,
+) *common.Flow {
+	return &common.Flow{
+		Name: name,
+		ExecuteFunc: func(peer *peerpkg.Peer) {
+			err := initializeFunc(route, peer)
+			if err != nil {
+				m.context.HandleError(err, name, isStopping, errChan)
+				return
+			}
+		},
+	}
+}
+
+// RegisterOneTimeFlow registers a one-time flow (that exits once some operations are done) to the given router.
+func (m *Manager) RegisterOneTimeFlow(name string, router *routerpkg.Router, messageTypes []appmessage.MessageCommand,
+	isStopping *uint32, stopChan chan error, initializeFunc common.FlowInitializeFunc,
+) *common.Flow {
+	route, err := router.AddIncomingRoute(name, messageTypes)
+	if err != nil {
+		panic(err)
+	}
+
+	return &common.Flow{
+		Name: name,
+		ExecuteFunc: func(peer *peerpkg.Peer) {
+			defer func() {
+				if len(messageTypes) == 0 {
+					router.ReleaseRoute(route)
+					return
+				}
+
+				err := router.RemoveRoute(messageTypes)
+				if err != nil {
+					panic(err)
+				}
+			}()
+
+			err := initializeFunc(route, peer)
+			if err != nil {
+				m.context.HandleError(err, name, isStopping, stopChan)
+				return
+			}
+		},
+	}
+}
+
+func registerHandshakeRoutes(router *routerpkg.Router) (
+	receiveVersionRoute, sendVersionRoute, receiveReadyRoute *routerpkg.Route,
+) {
+	receiveVersionRoute, err := router.AddIncomingRoute("recieveVersion - incoming", []appmessage.MessageCommand{appmessage.CmdVersion})
+	if err != nil {
+		panic(err)
+	}
+
+	sendVersionRoute, err = router.AddIncomingRoute("sendVersion - incoming", []appmessage.MessageCommand{appmessage.CmdVerAck})
+	if err != nil {
+		panic(err)
+	}
+
+	receiveReadyRoute, err = router.AddIncomingRoute("recieveReady - incoming", []appmessage.MessageCommand{appmessage.CmdReady})
+	if err != nil {
+		panic(err)
+	}
+
+	return receiveVersionRoute, sendVersionRoute, receiveReadyRoute
+}
+
+func removeHandshakeRoutes(router *routerpkg.Router) {
+	err := router.RemoveRoute([]appmessage.MessageCommand{appmessage.CmdVersion, appmessage.CmdVerAck, appmessage.CmdReady})
+	if err != nil {
+		panic(err)
+	}
+}

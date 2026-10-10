@@ -1,0 +1,484 @@
+package consensusstatemanager_test
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/database"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/testapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/testutils"
+)
+
+func TestAddBlockBetweenResolveVirtualCalls(t *testing.T) {
+	testutils.ForAllNets(t, true, func(t *testing.T, consensusConfig *consensus.Config) {
+		factory := consensus.NewFactory()
+
+		tc, teardown, err := factory.NewTestConsensus(consensusConfig, "TestAddBlockBetweenResolveVirtualCalls")
+		if err != nil {
+			t.Fatalf("Error setting up consensus: %+v", err)
+		}
+		defer teardown(false)
+
+		// This test mines two competing chains from genesis, so blocks at
+		// matching heights would otherwise share both blue score and default
+		// coinbase data and collide on their coinbase transaction ID.
+		tc.BlockBuilder().EnableUniqueDefaultCoinbaseExtraData()
+
+		hashes := []*externalapi.DomainHash{consensusConfig.GenesisHash}
+
+		// Create a chain of blocks
+		const initialChainLength = 10
+		previousBlockHash := consensusConfig.GenesisHash
+		for i := range initialChainLength {
+			previousBlockHash, _, err = tc.AddBlock([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			hashes = append(hashes, previousBlockHash)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in initial chain: %+v", i, err)
+			}
+		}
+
+		// Mine a chain with more blocks, to re-organize the DAG
+		const reorgChainLength = initialChainLength + 1
+		previousBlockHash = consensusConfig.GenesisHash
+		for i := range reorgChainLength {
+			previousBlock, _, err := tc.BuildBlockWithParents([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+			previousBlockHash = consensushashing.BlockHash(previousBlock)
+			hashes = append(hashes, previousBlockHash)
+
+			// Do not UTXO validate in order to resolve virtual later
+			err = tc.ValidateAndInsertBlock(previousBlock, false, true)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+		}
+
+		// Resolve one step
+		_, _, err = tc.ResolveVirtualWithMaxParam(2)
+		if err != nil {
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		emptyCoinbase := &externalapi.DomainCoinbaseData{
+			ScriptPublicKey: &externalapi.ScriptPublicKey{
+				Script:  nil,
+				Version: 0,
+			},
+		}
+
+		// Get template based on current resolve state
+		blockTemplate, err := tc.BuildBlockTemplate(emptyCoinbase, nil)
+		if err != nil {
+			t.Fatalf("Error building block template during virtual resolution of reorg: %+v", err)
+		}
+
+		// Resolve one more step
+		_, isCompletelyResolved, err := tc.ResolveVirtualWithMaxParam(2)
+		if err != nil {
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		// Add the mined block (now virtual was modified)
+		err = tc.ValidateAndInsertBlock(blockTemplate.Block, true, true)
+		if err != nil {
+			t.Fatalf("Error mining block during virtual resolution of reorg: %+v", err)
+		}
+		hashes = append(hashes, consensushashing.BlockHash(blockTemplate.Block))
+
+		// Complete resolving virtual
+		for !isCompletelyResolved {
+			_, isCompletelyResolved, err = tc.ResolveVirtualWithMaxParam(2)
+			if err != nil {
+				t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+			}
+		}
+
+		verifyUtxoDiffPaths(t, tc, hashes)
+	})
+}
+
+func TestAddGenesisChildAfterOneResolveVirtualCall(t *testing.T) {
+	testutils.ForAllNets(t, true, func(t *testing.T, consensusConfig *consensus.Config) {
+		factory := consensus.NewFactory()
+
+		tc, teardown, err := factory.NewTestConsensus(consensusConfig, "TestAddGenesisChildAfterOneResolveVirtualCall")
+		if err != nil {
+			t.Fatalf("Error setting up consensus: %+v", err)
+		}
+		defer teardown(false)
+
+		// This test mines two competing chains from genesis, so blocks at
+		// matching heights would otherwise share both blue score and default
+		// coinbase data and collide on their coinbase transaction ID.
+		tc.BlockBuilder().EnableUniqueDefaultCoinbaseExtraData()
+
+		hashes := []*externalapi.DomainHash{consensusConfig.GenesisHash}
+
+		// Create a chain of blocks
+		const initialChainLength = 6
+		previousBlockHash := consensusConfig.GenesisHash
+		for i := range initialChainLength {
+			previousBlockHash, _, err = tc.AddBlock([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			hashes = append(hashes, previousBlockHash)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in initial chain: %+v", i, err)
+			}
+		}
+
+		// Mine a chain with more blocks, to re-organize the DAG
+		const reorgChainLength = initialChainLength + 1
+		previousBlockHash = consensusConfig.GenesisHash
+		for i := range reorgChainLength {
+			previousBlock, _, err := tc.BuildBlockWithParents([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+			previousBlockHash = consensushashing.BlockHash(previousBlock)
+			hashes = append(hashes, previousBlockHash)
+
+			// Do not UTXO validate in order to resolve virtual later
+			err = tc.ValidateAndInsertBlock(previousBlock, false, true)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+		}
+
+		// Resolve one step
+		_, isCompletelyResolved, err := tc.ResolveVirtualWithMaxParam(2)
+		if err != nil {
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		_, _, err = tc.AddBlock([]*externalapi.DomainHash{consensusConfig.GenesisHash}, nil, nil)
+		if err != nil {
+			t.Fatalf("Error adding block during virtual resolution of reorg: %+v", err)
+		}
+
+		// Complete resolving virtual
+		for !isCompletelyResolved {
+			_, isCompletelyResolved, err = tc.ResolveVirtualWithMaxParam(2)
+			if err != nil {
+				t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+			}
+		}
+
+		verifyUtxoDiffPaths(t, tc, hashes)
+	})
+}
+
+func TestAddGenesisChildAfterTwoResolveVirtualCalls(t *testing.T) {
+	testutils.ForAllNets(t, true, func(t *testing.T, consensusConfig *consensus.Config) {
+		factory := consensus.NewFactory()
+
+		tc, teardown, err := factory.NewTestConsensus(consensusConfig, "TestAddGenesisChildAfterTwoResolveVirtualCalls")
+		if err != nil {
+			t.Fatalf("Error setting up consensus: %+v", err)
+		}
+		defer teardown(false)
+
+		// This test mines two competing chains from genesis, so blocks at
+		// matching heights would otherwise share both blue score and default
+		// coinbase data and collide on their coinbase transaction ID.
+		tc.BlockBuilder().EnableUniqueDefaultCoinbaseExtraData()
+
+		hashes := []*externalapi.DomainHash{consensusConfig.GenesisHash}
+
+		// Create a chain of blocks
+		const initialChainLength = 6
+		previousBlockHash := consensusConfig.GenesisHash
+		for i := range initialChainLength {
+			previousBlockHash, _, err = tc.AddBlock([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			hashes = append(hashes, previousBlockHash)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in initial chain: %+v", i, err)
+			}
+		}
+
+		// Mine a chain with more blocks, to re-organize the DAG
+		const reorgChainLength = initialChainLength + 1
+		previousBlockHash = consensusConfig.GenesisHash
+		for i := range reorgChainLength {
+			previousBlock, _, err := tc.BuildBlockWithParents([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+			previousBlockHash = consensushashing.BlockHash(previousBlock)
+			hashes = append(hashes, previousBlockHash)
+
+			// Do not UTXO validate in order to resolve virtual later
+			err = tc.ValidateAndInsertBlock(previousBlock, false, true)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+		}
+
+		// Resolve one step
+		_, _, err = tc.ResolveVirtualWithMaxParam(2)
+		if err != nil {
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		// Resolve one more step
+		_, isCompletelyResolved, err := tc.ResolveVirtualWithMaxParam(2)
+		if err != nil {
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		_, _, err = tc.AddBlock([]*externalapi.DomainHash{consensusConfig.GenesisHash}, nil, nil)
+		if err != nil {
+			t.Fatalf("Error adding block during virtual resolution of reorg: %+v", err)
+		}
+
+		// Complete resolving virtual
+		for !isCompletelyResolved {
+			_, isCompletelyResolved, err = tc.ResolveVirtualWithMaxParam(2)
+			if err != nil {
+				t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+			}
+		}
+
+		verifyUtxoDiffPaths(t, tc, hashes)
+	})
+}
+
+func TestResolveVirtualBackAndForthReorgs(t *testing.T) {
+	testutils.ForAllNets(t, true, func(t *testing.T, consensusConfig *consensus.Config) {
+		factory := consensus.NewFactory()
+
+		tc, teardown, err := factory.NewTestConsensus(consensusConfig, "TestAddGenesisChildAfterTwoResolveVirtualCalls")
+		if err != nil {
+			t.Fatalf("Error setting up consensus: %+v", err)
+		}
+		defer teardown(false)
+
+		// This test mines two competing chains from genesis, so blocks at
+		// matching heights would otherwise share both blue score and default
+		// coinbase data and collide on their coinbase transaction ID.
+		tc.BlockBuilder().EnableUniqueDefaultCoinbaseExtraData()
+
+		hashes := []*externalapi.DomainHash{consensusConfig.GenesisHash}
+		blocks := make(map[externalapi.DomainHash]string)
+		blocks[*consensusConfig.GenesisHash] = "g"
+		blocks[*model.VirtualBlockHash] = "v"
+		printfDebug("%s\n\n", consensusConfig.GenesisHash)
+
+		// Create a chain of blocks
+		const initialChainLength = 6
+		previousBlockHash := consensusConfig.GenesisHash
+		for i := range initialChainLength {
+			previousBlockHash, _, err = tc.AddBlock([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in initial chain: %+v", i, err)
+			}
+			blocks[*previousBlockHash] = fmt.Sprintf("A_%d", i)
+			hashes = append(hashes, previousBlockHash)
+			printfDebug("A_%d: %s\n", i, previousBlockHash)
+		}
+
+		printfDebug("\n")
+		verifyUtxoDiffPaths(t, tc, hashes)
+
+		firstChainTip := previousBlockHash
+
+		// Mine a chain with more blocks, to re-organize the DAG
+		const reorgChainLength = 12 // initialChainLength + 1
+		previousBlockHash = consensusConfig.GenesisHash
+		for i := range reorgChainLength {
+			previousBlock, _, err := tc.BuildBlockWithParents([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+			previousBlockHash = consensushashing.BlockHash(previousBlock)
+			blocks[*previousBlockHash] = fmt.Sprintf("B_%d", i)
+			hashes = append(hashes, previousBlockHash)
+			printfDebug("B_%d: %s\n", i, previousBlockHash)
+
+			// Do not UTXO validate in order to resolve virtual later
+			err = tc.ValidateAndInsertBlock(previousBlock, false, true)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in re-org chain: %+v", i, err)
+			}
+		}
+
+		printfDebug("\n")
+
+		printUtxoDiffChildren(t, tc, hashes, blocks)
+		verifyUtxoDiffPaths(t, tc, hashes)
+
+		previousVirtualSelectedParent, err := tc.GetVirtualSelectedParent()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Resolve one step
+		virtualChangeSet, _, err := tc.ResolveVirtualWithMaxParam(3)
+		if err != nil {
+			printUtxoDiffChildren(t, tc, hashes, blocks)
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		newVirtualSelectedParent, err := tc.GetVirtualSelectedParent()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Make sure the reported change-set is compatible with actual changes.
+		// Checking this for one call should suffice to avoid possible bugs.
+		//
+		// Note: ResolveVirtualWithMaxParam may return a nil changeset when nothing changed.
+		// Treat nil change-set/path as “no selected-parent-chain changes”.
+		var removed []*externalapi.DomainHash
+		var added []*externalapi.DomainHash
+		if virtualChangeSet != nil && virtualChangeSet.VirtualSelectedParentChainChanges != nil {
+			removed = virtualChangeSet.VirtualSelectedParentChainChanges.Removed
+			added = virtualChangeSet.VirtualSelectedParentChainChanges.Added
+		}
+		if len(removed) == 0 || len(added) == 0 {
+			if !previousVirtualSelectedParent.Equal(newVirtualSelectedParent) {
+				t.Fatalf("Expected virtual selected parent to not change when changeset reports no selected-parent-chain changes")
+			}
+		} else {
+			reportedPreviousVirtualSelectedParent := removed[0]
+			reportedNewVirtualSelectedParent := added[len(added)-1]
+
+			if !previousVirtualSelectedParent.Equal(reportedPreviousVirtualSelectedParent) {
+				t.Fatalf("The reported changeset is incompatible with actual changes")
+			}
+			if !newVirtualSelectedParent.Equal(reportedNewVirtualSelectedParent) {
+				t.Fatalf("The reported changeset is incompatible with actual changes")
+			}
+		}
+
+		// Resolve one more step
+		_, isCompletelyResolved, err := tc.ResolveVirtualWithMaxParam(3)
+		if err != nil {
+			t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+		}
+
+		// Complete resolving virtual
+		for !isCompletelyResolved {
+			_, isCompletelyResolved, err = tc.ResolveVirtualWithMaxParam(3)
+			if err != nil {
+				t.Fatalf("Error resolving virtual in re-org chain: %+v", err)
+			}
+		}
+
+		printUtxoDiffChildren(t, tc, hashes, blocks)
+		verifyUtxoDiffPaths(t, tc, hashes)
+
+		// Now get the first chain back to the wining position
+		previousBlockHash = firstChainTip
+		for i := range reorgChainLength {
+			previousBlockHash, _, err = tc.AddBlock([]*externalapi.DomainHash{previousBlockHash}, nil, nil)
+			if err != nil {
+				t.Fatalf("Error mining block no. %d in initial chain: %+v", initialChainLength+i, err)
+			}
+			blocks[*previousBlockHash] = fmt.Sprintf("A_%d", initialChainLength+i)
+			hashes = append(hashes, previousBlockHash)
+			printfDebug("A_%d: %s\n", initialChainLength+i, previousBlockHash)
+		}
+
+		printfDebug("\n")
+
+		printUtxoDiffChildren(t, tc, hashes, blocks)
+		verifyUtxoDiffPaths(t, tc, hashes)
+	})
+}
+
+func verifyUTXODiffChildChainTerminates(t *testing.T, tc testapi.TestConsensus, stagingArea *model.StagingArea, start *externalapi.DomainHash) {
+	visited := map[externalapi.DomainHash]struct{}{}
+	current := start
+
+	for range 1_000_000 {
+		if _, ok := visited[*current]; ok {
+			t.Fatalf("UTXO diff child chain contains a cycle at %s", current)
+		}
+		visited[*current] = struct{}{}
+
+		hasChild, err := tc.UTXODiffStore().HasUTXODiffChild(tc.DatabaseContext(), stagingArea, current)
+		if err != nil {
+			t.Fatalf("Error while reading utxo diff store: %+v", err)
+		}
+		if !hasChild {
+			// No explicit child means the child is the virtual; ensure the current block has a diff.
+			_, err := tc.UTXODiffStore().UTXODiff(tc.DatabaseContext(), stagingArea, current)
+			if err != nil {
+				t.Fatalf("Expected %s to have a utxo diff: %+v", current, err)
+			}
+			return
+		}
+
+		next, err := tc.UTXODiffStore().UTXODiffChild(tc.DatabaseContext(), stagingArea, current)
+		if err != nil {
+			t.Fatalf("Error while reading utxo diff store: %+v", err)
+		}
+		if next == nil {
+			t.Fatalf("HasUTXODiffChild returned true for %s but UTXODiffChild returned nil", current)
+		}
+		current = next
+	}
+
+	t.Fatalf("UTXO diff child chain starting at %s did not terminate", start)
+}
+
+func verifyUtxoDiffPaths(t *testing.T, tc testapi.TestConsensus, hashes []*externalapi.DomainHash) {
+	stagingArea := model.NewStagingArea()
+
+	virtualGHOSTDAGData, err := tc.GHOSTDAGDataStore().Get(tc.DatabaseContext(), stagingArea, model.VirtualBlockHash, false)
+	if database.IsNotFoundError(err) {
+		t.Fatalf("verifyUtxoDiffPaths failed to retrieve with %s\n", model.VirtualBlockHash)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	utxoDiffRoot := virtualGHOSTDAGData.SelectedParent()
+	_, err = tc.UTXODiffStore().UTXODiff(tc.DatabaseContext(), stagingArea, utxoDiffRoot)
+	if err != nil {
+		t.Fatalf("Virtual selected parent is expected to have a utxo diff: %+v", err)
+	}
+
+	for _, block := range hashes {
+		hasUTXODiffChild, err := tc.UTXODiffStore().HasUTXODiffChild(tc.DatabaseContext(), stagingArea, block)
+		if err != nil {
+			t.Fatalf("Error while reading utxo diff store: %+v", err)
+		}
+		if hasUTXODiffChild {
+			verifyUTXODiffChildChainTerminates(t, tc, stagingArea, block)
+		}
+	}
+}
+
+func printfDebug(_ string, _ ...any) {
+	// Uncomment below when debugging the test
+	// fmt.Printf(format, a...)
+}
+
+func printUtxoDiffChildren(t *testing.T, tc testapi.TestConsensus, hashes []*externalapi.DomainHash, blocks map[externalapi.DomainHash]string) {
+	printfDebug("\n===============================\nBlock\t\tDiff child\n")
+	stagingArea := model.NewStagingArea()
+	for _, block := range hashes {
+		hasUTXODiffChild, err := tc.UTXODiffStore().HasUTXODiffChild(tc.DatabaseContext(), stagingArea, block)
+		if err != nil {
+			t.Fatalf("Error while reading utxo diff store: %+v", err)
+		}
+		if hasUTXODiffChild {
+			utxoDiffChild, err := tc.UTXODiffStore().UTXODiffChild(tc.DatabaseContext(), stagingArea, block)
+			if err != nil {
+				t.Fatalf("Error while reading utxo diff store: %+v", err)
+			}
+			printfDebug("%s\t\t\t%s\n", blocks[*block], blocks[*utxoDiffChild])
+		} else {
+			printfDebug("%s\n", blocks[*block])
+		}
+	}
+	printfDebug("\n===============================\n")
+}

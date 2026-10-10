@@ -1,0 +1,96 @@
+name: Build and upload assets
+on:
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest          # linux/amd64
+          - ubuntu-24.04-arm       # linux/arm64 (aarch64)
+          - windows-latest
+          - macos-latest
+    name: Building, ${{ matrix.os }}
+    steps:
+      - name: Fix CRLF on Windows
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build on Linux
+        if: runner.os == 'Linux'
+        env:
+          GOEXPERIMENT: "simd,jsonv2"
+        run: |
+          mkdir -p bin
+          go build -v -ldflags="-s -w -extldflags=-static" -tags netgo,osusergo -o ./bin/ . ./cmd/...
+
+          # Detect architecture
+          if [ "${{ runner.arch }}" = "ARM64" ]; then
+            ARCH=aarch64
+          else
+            ARCH=amd64
+          fi
+
+          archive="bin/HTND-${{ github.event.release.tag_name }}-linux-${ARCH}.zip"
+          zip -r "${archive}" ./bin/*
+          sha1sum "${archive}" > "${archive}.sha1sum"
+
+          echo "archive=${archive}" >> $GITHUB_ENV
+
+      - name: Build on Windows
+        if: runner.os == 'Windows'
+        env:
+          GOEXPERIMENT: "simd,jsonv2"
+        shell: bash
+        run: |
+          mkdir -p bin
+          go build -v \
+            -ldflags="-s -w -buildid=" \
+            -trimpath \
+            -o bin/ . ./cmd/...
+
+          archive="bin/HTND-${{ github.event.release.tag_name }}-windows-amd64.zip"
+
+          powershell -Command "
+            Compress-Archive -Path bin/* -DestinationPath '${archive}' -Force;
+            \$hash = Get-FileHash '${archive}' -Algorithm SHA1;
+            \$hash.Hash + ' *' + (Split-Path -Leaf '${archive}') | Out-File '${archive}.sha1sum' -Encoding ascii
+          "
+
+          echo "archive=${archive}" >> $GITHUB_ENV
+
+      - name: Build on MacOS
+        if: runner.os == 'macOS'
+        env:
+          GOEXPERIMENT: "simd,jsonv2"
+        run: |
+          mkdir -p bin
+          go build -v -ldflags="-s -w" -o ./bin/ . ./cmd/...
+          archive="bin/HTND-${{ github.event.release.tag_name }}-osx.zip"
+          zip -r "${archive}" ./bin/*
+          sha1sum "${archive}" > "${archive}.sha1sum"
+          echo "archive=${archive}" >> $GITHUB_ENV
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ./${{ env.archive }}
+            ./${{ env.archive }}.sha1sum   # optional – you were generating them but not uploading

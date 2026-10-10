@@ -1,0 +1,101 @@
+package externalapi
+
+import "time"
+
+// Consensus maintains the current core state of the node
+type Consensus interface {
+	Init(skipAddingGenesis bool) error
+	BuildBlock(coinbaseData *DomainCoinbaseData, transactions []*DomainTransaction) (*DomainBlock, error)
+	BuildBlockTemplate(coinbaseData *DomainCoinbaseData, transactions []*DomainTransaction) (*DomainBlockTemplate, error)
+	ValidateAndInsertBlock(block *DomainBlock, updateVirtual bool, powSkip bool) error
+	ValidateAndInsertBlockWithTrustedData(block *BlockWithTrustedData, validateUTXO bool) error
+	ValidateTransactionAndPopulateWithConsensusData(transaction *DomainTransaction) error
+	ImportPruningPoints(pruningPoints []BlockHeader) error
+	BuildPruningPointProof() (*PruningPointProof, error)
+	ValidatePruningPointProof(pruningPointProof *PruningPointProof) error
+	ApplyPruningPointProof(pruningPointProof *PruningPointProof) error
+	HasBlock(blockHash *DomainHash) (bool, error)
+	GetBlock(blockHash *DomainHash) (*DomainBlock, bool, error)
+	GetBlockEvenIfHeaderOnly(blockHash *DomainHash) (*DomainBlock, error)
+	GetBlockHeader(blockHash *DomainHash) (BlockHeader, error)
+	// GetBlockHeaders returns the headers for the given block hashes using a single internal read context.
+	// This is significantly more efficient than calling GetBlockHeader repeatedly for many hashes.
+	GetBlockHeaders(blockHashes []*DomainHash) ([]BlockHeader, error)
+	GetBlockInfo(blockHash *DomainHash) (*BlockInfo, error)
+	GetBlockRelations(blockHash *DomainHash) (parents []*DomainHash, children []*DomainHash, err error)
+	GetBlockAcceptanceData(blockHash *DomainHash) (AcceptanceData, error)
+	GetBlocksAcceptanceData(blockHashes []*DomainHash) ([]AcceptanceData, error)
+
+	GetHashesBetween(lowHash, highHash *DomainHash, maxBlocks uint64, brute bool) (hashes []*DomainHash, actualHighHash *DomainHash, err error)
+	GetAnticone(blockHash, contextHash *DomainHash, maxBlocks uint64) (hashes []*DomainHash, err error)
+	GetMissingBlockBodyHashes(highHash *DomainHash) ([]*DomainHash, error)
+	GetPruningPointUTXOs(expectedPruningPointHash *DomainHash, fromOutpoint *DomainOutpoint, limit int) ([]*OutpointAndUTXOEntryPair, error)
+	GetVirtualUTXOs(expectedVirtualParents []*DomainHash, fromOutpoint *DomainOutpoint, limit int) ([]*OutpointAndUTXOEntryPair, error)
+	// GetVirtualUTXOEntries returns, for each outpoint, the entry virtual's UTXO set holds for it, or
+	// nil where it holds none. It is the authoritative answer to "does this coin exist, and what is
+	// it", for callers that serve coins to spenders from a secondary index. It never queues behind
+	// block processing: if the consensus lock cannot be taken within maxWait it returns ok=false and
+	// no entries, and the caller decides what to serve instead. virtualParents are virtual's parents
+	// while the lookup ran, or nil if virtual moved between the chunks the lookup is split into.
+	GetVirtualUTXOEntries(outpoints []*DomainOutpoint, maxWait time.Duration) (entries []UTXOEntry, virtualParents []*DomainHash, ok bool, err error)
+	PruningPoint() (*DomainHash, error)
+	PruningPointHeaders() ([]BlockHeader, error)
+	PruningPointAndItsAnticone() ([]*DomainHash, error)
+	ClearImportedPruningPointData() error
+	AppendImportedPruningPointUTXOs(outpointAndUTXOEntryPairs []*OutpointAndUTXOEntryPair) error
+	ValidateAndInsertImportedPruningPoint(newPruningPoint *DomainHash) error
+	GetVirtualSelectedParent() (*DomainHash, error)
+	CreateBlockLocatorFromPruningPoint(highHash *DomainHash, limit uint32) (BlockLocator, error)
+	CreateHeadersSelectedChainBlockLocator(lowHash, highHash *DomainHash) (BlockLocator, error)
+	CreateFullHeadersSelectedChainBlockLocator() (BlockLocator, error)
+	GetSyncInfo() (*SyncInfo, error)
+	Tips() ([]*DomainHash, error)
+	GetVirtualInfo() (*VirtualInfo, error)
+	GetVirtualDAAScore() (uint64, error)
+	IsValidPruningPoint(blockHash *DomainHash) (bool, error)
+	ValidateLowHashIsFunctionalPruningPoint(lowHash *DomainHash) (*DomainHash, error)
+	ArePruningPointsViolatingFinality(pruningPoints []BlockHeader) (bool, error)
+	GetVirtualSelectedParentChainFromBlock(blockHash *DomainHash) (*SelectedChainPath, error)
+	IsInSelectedParentChainOf(blockHashA *DomainHash, blockHashB *DomainHash) (bool, error)
+	GetHeadersSelectedTip() (*DomainHash, error)
+	Anticone(blockHash *DomainHash) ([]*DomainHash, error)
+	EstimateNetworkHashesPerSecond(startHash *DomainHash, windowSize int) (uint64, error)
+	PopulateMass(transaction *DomainTransaction)
+	ResolveVirtual(progressReportCallback func(uint64, uint64)) error
+	BlockDAAWindowHashes(blockHash *DomainHash) ([]*DomainHash, error)
+	TrustedDataDataDAAHeader(trustedBlockHash, daaBlockHash *DomainHash, daaBlockWindowIndex uint64) (*TrustedDataDataDAAHeader, error)
+	TrustedBlockAssociatedGHOSTDAGDataBlockHashes(blockHash *DomainHash) ([]*DomainHash, error)
+	TrustedGHOSTDAGData(blockHash *DomainHash) (*BlockGHOSTDAGData, error)
+	IsChainBlock(blockHash *DomainHash) (bool, error)
+	VirtualMergeDepthRoot() (*DomainHash, error)
+	IsNearlySynced() (bool, error)
+	// UTXOSetHealth reports whether this node's pruning point UTXO baseline hashes to the UTXO
+	// commitment in the pruning point's own header - i.e. whether this node's UTXO set, and the
+	// balances and transaction verdicts derived from it, can be trusted to agree with the network.
+	UTXOSetHealth() (*UTXOSetHealth, error)
+	ResolveBlockStatus(blockHash *DomainHash, useSeparateStagingAreaPerBlock bool) (BlockStatus, error)
+	RepairBlockStatuses() error
+	RepairDisqualifiedTipChains() (uint64, error)
+	RepairMissingMultisets() (uint64, error)
+	ReresolveInvalidBlocks() error
+	GetBlockByTransactionID(transactionID *DomainTransactionID) (*DomainBlock, error)
+	CheckMergeSetBluesAndIfBlockExistsInThem(searchedBlock *DomainHash) error
+
+	// IterateUTXOSetAtBlock streams the full UTXO set as of the given (past, UTXO-valid) block,
+	// invoking callback once for every outpoint/entry pair. The whole iteration runs under the
+	// consensus lock, so callback must not call back into this Consensus instance. This is used
+	// by tooling (e.g. the exodus pruning point candidate generator) that needs the UTXO set of
+	// an arbitrary historical block, not just the current pruning point or virtual.
+	IterateUTXOSetAtBlock(blockHash *DomainHash, callback func(outpoint *DomainOutpoint, entry UTXOEntry) error) error
+
+	// IterateUTXOSetAtBlockFromAcceptanceData streams the same set as IterateUTXOSetAtBlock, derived
+	// independently: the pruning point's UTXO set with every accepted transaction up to blockHash
+	// applied from the recorded acceptance data, rather than read out of virtual's materialised UTXO
+	// table via the stored UTXO-diff chain. The two derivations are meant to agree and in practice do
+	// not - the materialised table is never recomputed, so a mis-applied diff persists - and it is
+	// this one that reproduces the UTXO commitments in block headers. Tooling that produces a set
+	// intended to be trusted should use it. The whole iteration runs under the consensus lock, so
+	// callback must not call back into this Consensus instance.
+	IterateUTXOSetAtBlockFromAcceptanceData(blockHash *DomainHash,
+		callback func(outpoint *DomainOutpoint, entry UTXOEntry) error) error
+}

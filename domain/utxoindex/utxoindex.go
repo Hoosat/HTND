@@ -1,0 +1,448 @@
+package utxoindex
+
+import (
+	"errors"
+	"sync"
+	"sync/atomic"
+
+	"github.com/HoosatNetwork/HTND/v2/domain"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/db/database"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/logger"
+	"github.com/HoosatNetwork/HTND/v2/util/memory"
+)
+
+var ErrUTXOIndexSyncing = errors.New("utxo index is syncing")
+
+// UTXOIndex maintains an index between transaction scriptPublicKeys
+// and UTXOs
+type UTXOIndex struct {
+	domain domain.Domain
+	store  *utxoIndexStore
+
+	mutex   sync.RWMutex
+	syncing atomic.Bool
+	// virtualParents are those of the last virtual change the index applied, nil while unknown.
+	// Guarded by mutex.
+	virtualParents []*externalapi.DomainHash
+	// utxoIndexCache *utxoIndexLRUCache
+	// maxCacheSize   int
+}
+
+// type utxoIndexLRUCache struct {
+// 	maxSize    int
+// 	items      map[string]*utxoIndexLRUNode
+// 	head, tail *utxoIndexLRUNode
+// }
+
+// type utxoIndexLRUNode struct {
+// 	key        string
+// 	value      []UTXOPair
+// 	prev, next *utxoIndexLRUNode
+// }
+
+// func newUtxoIndexLRUCache(maxSize int) *utxoIndexLRUCache {
+// 	return &utxoIndexLRUCache{
+// 		maxSize: maxSize,
+// 		items:   make(map[string]*utxoIndexLRUNode),
+// 	}
+// }
+
+// func (c *utxoIndexLRUCache) Get(key string) ([]UTXOPair, bool) {
+// 	node, ok := c.items[key]
+// 	if !ok {
+// 		return nil, false
+// 	}
+// 	c.moveToFront(node)
+// 	return node.value, true
+// }
+
+// func (c *utxoIndexLRUCache) Put(key string, value []UTXOPair) {
+// 	if node, ok := c.items[key]; ok {
+// 		node.value = value
+// 		c.moveToFront(node)
+// 		return
+// 	}
+// 	node := &utxoIndexLRUNode{key: key, value: value}
+// 	c.items[key] = node
+// 	c.addToFront(node)
+// 	if len(c.items) > c.maxSize {
+// 		c.evict()
+// 	}
+// }
+
+// func (c *utxoIndexLRUCache) Delete(key string) {
+// 	node, ok := c.items[key]
+// 	if !ok {
+// 		return
+// 	}
+// 	c.remove(node)
+// 	delete(c.items, key)
+// }
+
+// func (c *utxoIndexLRUCache) moveToFront(node *utxoIndexLRUNode) {
+// 	if c.head == node {
+// 		return
+// 	}
+// 	c.remove(node)
+// 	c.addToFront(node)
+// }
+
+// func (c *utxoIndexLRUCache) addToFront(node *utxoIndexLRUNode) {
+// 	node.prev = nil
+// 	node.next = c.head
+// 	if c.head != nil {
+// 		c.head.prev = node
+// 	}
+// 	c.head = node
+// 	if c.tail == nil {
+// 		c.tail = node
+// 	}
+// }
+
+// func (c *utxoIndexLRUCache) remove(node *utxoIndexLRUNode) {
+// 	if node.prev != nil {
+// 		node.prev.next = node.next
+// 	} else {
+// 		c.head = node.next
+// 	}
+// 	if node.next != nil {
+// 		node.next.prev = node.prev
+// 	} else {
+// 		c.tail = node.prev
+// 	}
+// }
+
+// func (c *utxoIndexLRUCache) evict() {
+// 	if c.tail == nil {
+// 		return
+// 	}
+// 	key := c.tail.key
+// 	c.remove(c.tail)
+// 	delete(c.items, key)
+// }
+
+// New creates a new UTXO index.
+//
+// NOTE: While this is called no new blocks can be added to the consensus.
+func New(domain domain.Domain, database database.Database) (*UTXOIndex, error) {
+	utxoIndex := &UTXOIndex{
+		domain: domain,
+		store:  newUTXOIndexStore(database),
+		// utxoIndexCache: newUtxoIndexLRUCache(defaultCacheSize),
+		// maxCacheSize: defaultCacheSize,
+	}
+	isSynced, err := utxoIndex.isSynced()
+	if err != nil {
+		return nil, err
+	}
+
+	///Has check is for migration to circulating supply, can be removed eventually.
+	hasCirculatingSupplyKey, err := utxoIndex.store.database.Has(circulatingSupplyKey)
+	if err != nil {
+		return nil, err
+	}
+	hasUTXOCountsInitializedKey, err := utxoIndex.store.database.Has(utxoCountsInitializedKey)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isSynced || !hasCirculatingSupplyKey || !hasUTXOCountsInitializedKey {
+
+		err := utxoIndex.Reset()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		utxoIndex.virtualParents, err = utxoIndex.store.getVirtualParents()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return utxoIndex, nil
+}
+
+// Reset deletes the whole UTXO index and resyncs it from consensus.
+func (ui *UTXOIndex) Reset() error {
+	if !ui.syncing.CompareAndSwap(false, true) {
+		return ErrUTXOIndexSyncing
+	}
+	defer ui.syncing.Store(false)
+
+	ui.mutex.Lock()
+	defer ui.mutex.Unlock()
+
+	log.Infof("Starting UTXO index reset")
+	ui.virtualParents = nil
+
+	err := ui.store.deleteAll()
+	if err != nil {
+		return err
+	}
+
+	virtualInfo, err := ui.domain.Consensus().GetVirtualInfo()
+	if err != nil {
+		return err
+	}
+
+	err = ui.store.initializeCirculatingSompiSupply() // At this point the database is empty, so the sole purpose of this call is to initialize the circulating supply key
+	if err != nil {
+		return err
+	}
+	log.Infof("Cleared UTXO index and initialize circulating supply key")
+	log.Infof("Start processing virtual UTXOs")
+
+	var fromOutpoint *externalapi.DomainOutpoint
+	const step = 1000
+	stepsTaken := 1
+	for {
+		virtualUTXOs, err := ui.domain.Consensus().GetVirtualUTXOs(virtualInfo.ParentHashes, fromOutpoint, step)
+		if err != nil {
+			return err
+		}
+
+		err = ui.store.addAndCommitOutpointsWithoutTransaction(virtualUTXOs)
+		if err != nil {
+			return err
+		}
+
+		if len(virtualUTXOs) < step {
+			log.Infof("Processed %d virtual UTXOs", len(virtualUTXOs)+step*stepsTaken)
+			break
+		}
+
+		fromOutpoint = virtualUTXOs[len(virtualUTXOs)-1].Outpoint
+
+		log.Infof("Processed %d virtual UTXOs", step*stepsTaken)
+		stepsTaken++
+	}
+
+	log.Infof("Finished processing virtual UTXOs")
+
+	// This has to be done last to mark that the reset went smoothly and no reset has to be called next time.
+	err = ui.store.updateAndCommitVirtualParentsWithoutTransaction(virtualInfo.ParentHashes)
+	if err != nil {
+		return err
+	}
+	ui.virtualParents = externalapi.CloneHashes(virtualInfo.ParentHashes)
+
+	log.Infof("Finished UTXO index reset")
+	return nil
+}
+
+func (ui *UTXOIndex) readLockOrSyncingError() (func(), error) {
+	if ui.syncing.Load() {
+		return nil, ErrUTXOIndexSyncing
+	}
+
+	if ui.mutex.TryRLock() {
+		if ui.syncing.Load() {
+			ui.mutex.RUnlock()
+			return nil, ErrUTXOIndexSyncing
+		}
+		return ui.mutex.RUnlock, nil
+	}
+
+	if ui.syncing.Load() {
+		return nil, ErrUTXOIndexSyncing
+	}
+
+	ui.mutex.RLock()
+	if ui.syncing.Load() {
+		ui.mutex.RUnlock()
+		return nil, ErrUTXOIndexSyncing
+	}
+
+	return ui.mutex.RUnlock, nil
+}
+
+func (ui *UTXOIndex) isSynced() (bool, error) {
+	needsReset, err := ui.store.needsReset()
+	if err != nil {
+		return false, err
+	}
+	if needsReset {
+		log.Infof("The UTXO index missed a virtual UTXO diff while the node was running; rebuilding it")
+		return false, nil
+	}
+
+	utxoIndexVirtualParents, err := ui.store.getVirtualParents()
+	if err != nil {
+		if database.IsNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	virtualInfo, err := ui.domain.Consensus().GetVirtualInfo()
+	if err != nil {
+		return false, err
+	}
+
+	return externalapi.HashesEqual(virtualInfo.ParentHashes, utxoIndexVirtualParents), nil
+}
+
+// Update updates the UTXO index with the given DAG selected parent chain changes
+func (ui *UTXOIndex) Update(virtualChangeSet *externalapi.VirtualChangeSet) (*UTXOChanges, error) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "UTXOIndex.Update")
+	defer onEnd()
+
+	ui.mutex.Lock()
+	defer ui.mutex.Unlock()
+
+	if virtualChangeSet.EarlierChangeSetsDropped {
+		// A diff never reached the index, so it holds coins consensus has spent or lacks coins
+		// consensus created, and no later diff corrects that. Rebuilding right here is not an option:
+		// Reset pages through virtual's UTXO set and gives up as soon as virtual moves, which on a
+		// running node it does every block. Mark the index so the next start rebuilds it; until then
+		// the UTXO RPCs keep checking what they serve against virtual.
+		log.Errorf("The UTXO index missed a virtual UTXO diff (the consensus events channel was full), " +
+			"so it no longer matches consensus. It will be rebuilt on the next start")
+		err := ui.store.markNeedsReset()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	log.Tracef("Updating UTXO index with VirtualUTXODiff: %+v", virtualChangeSet.VirtualUTXODiff)
+	err := ui.removeUTXOs(virtualChangeSet.VirtualUTXODiff.ToRemove())
+	if err != nil {
+		return nil, err
+	}
+
+	err = ui.addUTXOs(virtualChangeSet.VirtualUTXODiff.ToAdd())
+	if err != nil {
+		return nil, err
+	}
+
+	ui.store.updateVirtualParents(virtualChangeSet.VirtualParents)
+
+	added, removed, _ := ui.store.stagedData()
+	utxoIndexChanges := &UTXOChanges{
+		Added:   added,
+		Removed: removed,
+	}
+
+	err = ui.store.commit()
+	if err != nil {
+		return nil, err
+	}
+	ui.virtualParents = externalapi.CloneHashes(virtualChangeSet.VirtualParents)
+
+	log.Tracef("UTXO index updated with the UTXOChanged: %+v", utxoIndexChanges)
+	return utxoIndexChanges, nil
+}
+
+func (ui *UTXOIndex) addUTXOs(toAdd externalapi.UTXOCollection) error {
+	iterator := toAdd.Iterator()
+	defer iterator.Close()
+	for ok := iterator.First(); ok; ok = iterator.Next() {
+		outpoint, entry, err := iterator.Get()
+		if err != nil {
+			return err
+		}
+
+		log.Tracef("Adding outpoint %s to UTXO index", outpoint)
+		// ui.utxoIndexCache.Delete(entry.ScriptPublicKey().String())
+		err = ui.store.add(entry.ScriptPublicKey(), outpoint, entry)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ui *UTXOIndex) removeUTXOs(toRemove externalapi.UTXOCollection) error {
+	iterator := toRemove.Iterator()
+	defer iterator.Close()
+	for ok := iterator.First(); ok; ok = iterator.Next() {
+		outpoint, entry, err := iterator.Get()
+		if err != nil {
+			return err
+		}
+
+		log.Tracef("Removing outpoint %s from UTXO index", outpoint)
+		// ui.utxoIndexCache.Delete(entry.ScriptPublicKey().String())
+		err = ui.store.remove(entry.ScriptPublicKey(), outpoint, entry)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UTXOs returns all the UTXOs for the given scriptPublicKey, together with the virtual parents of the
+// last change the index applied, read under the same lock (see rpccontext.FilterUTXOPairsAgainstVirtual)
+func (ui *UTXOIndex) UTXOs(scriptPublicKey *externalapi.ScriptPublicKey, limit uint32, buffer *memory.Block[UTXOPair]) (
+	[]UTXOPair, *memory.Block[UTXOPair], []*externalapi.DomainHash, error,
+) {
+	unlock, err := ui.readLockOrSyncingError()
+	if err != nil {
+		return nil, buffer, nil, err
+	}
+	defer unlock()
+
+	// if pair, ok := ui.utxoIndexCache.Get(scriptPublicKey.String()); ok {
+	// 	return pair, nil
+	// }
+
+	pair, updatedBuffer, err := ui.store.UTXOs(scriptPublicKey, limit, buffer)
+	// ui.utxoIndexCache.Put(scriptPublicKey.String(), pair)
+	return pair, updatedBuffer, externalapi.CloneHashes(ui.virtualParents), err
+}
+
+// PaginatedUTXOs returns a page of the UTXOs for the given scriptPublicKey, together with the virtual
+// parents of the last change the index applied, read under the same lock
+func (ui *UTXOIndex) PaginatedUTXOs(scriptPublicKey *externalapi.ScriptPublicKey, offset uint32, limit uint32, buffer *memory.Block[UTXOPair]) (
+	[]UTXOPair, *memory.Block[UTXOPair], []*externalapi.DomainHash, error,
+) {
+	unlock, err := ui.readLockOrSyncingError()
+	if err != nil {
+		return nil, buffer, nil, err
+	}
+	defer unlock()
+
+	// if pair, ok := ui.utxoIndexCache.Get(scriptPublicKey.String()); ok {
+	// 	return pair, nil
+	// }
+
+	pair, updatedBuffer, err := ui.store.PaginatedUTXOs(scriptPublicKey, offset, limit, buffer)
+	// ui.utxoIndexCache.Put(scriptPublicKey.String(), pair)
+	return pair, updatedBuffer, externalapi.CloneHashes(ui.virtualParents), err
+}
+
+// UTXOs returns all the UTXOs for the given scriptPublicKey
+func (ui *UTXOIndex) HasUTXOs(scriptPublicKey *externalapi.ScriptPublicKey) (bool, error) {
+	unlock, err := ui.readLockOrSyncingError()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+
+	usable, err := ui.store.HasUTXOs(scriptPublicKey)
+	return usable, err
+}
+
+// GetBalance returns the total balance for the given scriptPublicKey
+func (ui *UTXOIndex) GetBalance(scriptPublicKey *externalapi.ScriptPublicKey) (uint64, error) {
+	unlock, err := ui.readLockOrSyncingError()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
+	balance, err := ui.store.GetBalance(scriptPublicKey)
+	return balance, err
+}
+
+// GetCirculatingSompiSupply returns the current circulating supply of sompis in the network
+func (ui *UTXOIndex) GetCirculatingSompiSupply() (uint64, error) {
+	unlock, err := ui.readLockOrSyncingError()
+	if err != nil {
+		return 0, err
+	}
+	defer unlock()
+
+	return ui.store.getCirculatingSompiSupply()
+}

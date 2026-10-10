@@ -1,0 +1,97 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/HoosatNetwork/HTND/v2/cmd/htnwallet/libhtnwallet/serialization"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/constants"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/txscript"
+	"github.com/pkg/errors"
+)
+
+var sigBuf [256]byte
+
+func fastHex(dst []byte, src []byte) string {
+	n := hex.Encode(dst, src)
+	return string(dst[:n])
+}
+
+func parse(conf *parseConfig) error {
+	if conf.Transaction == "" && conf.TransactionFile == "" {
+		return errors.Errorf("Either --transaction or --transaction-file is required")
+	}
+	if conf.Transaction != "" && conf.TransactionFile != "" {
+		return errors.Errorf("Both --transaction and --transaction-file cannot be passed at the same time")
+	}
+
+	transactionHex := conf.Transaction
+	if conf.TransactionFile != "" {
+		transactionHexBytes, err := os.ReadFile(conf.TransactionFile)
+		if err != nil {
+			return errors.Wrapf(err, "Could not read hex from %s", conf.TransactionFile)
+		}
+		transactionHex = strings.TrimSpace(string(transactionHexBytes))
+	}
+
+	transactions, err := decodeTransactionsFromHex(transactionHex)
+	if err != nil {
+		return err
+	}
+	for i, transaction := range transactions {
+
+		partiallySignedTransaction, err := serialization.DeserializePartiallySignedTransaction(transaction)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("Transaction #%d ID: \t%s\n", i+1, consensushashing.TransactionID(partiallySignedTransaction.Tx))
+		fmt.Println()
+
+		allInputSompi := uint64(0)
+		for index, input := range partiallySignedTransaction.Tx.Inputs {
+			partiallySignedInput := partiallySignedTransaction.PartiallySignedInputs[index]
+
+			if conf.Verbose {
+				fmt.Printf("Input %d: \tOutpoint: %s:%d \tAmount: %.2f Hoosat\n", index, input.PreviousOutpoint.TransactionID,
+					input.PreviousOutpoint.Index, float64(partiallySignedInput.PrevOutput.Value)/float64(constants.SompiPerHoosat))
+			}
+
+			allInputSompi += partiallySignedInput.PrevOutput.Value
+		}
+		if conf.Verbose {
+			fmt.Println()
+		}
+
+		allOutputSompi := uint64(0)
+		for index, output := range partiallySignedTransaction.Tx.Outputs {
+			scriptPublicKeyType, scriptPublicKeyAddress, err := txscript.ExtractScriptPubKeyAddress(output.ScriptPublicKey, conf.ActiveNetParams)
+			if err != nil {
+				return err
+			}
+
+			// A non-standard script, or a bare multisig one, has no address: ExtractScriptPubKeyAddress returns a
+			// nil address for it, and calling EncodeAddress before checking panicked.
+			var addressString string
+			if scriptPublicKeyType == txscript.NonStandardTy || scriptPublicKeyAddress == nil {
+				scriptPublicKeyHex := fastHex(sigBuf[:], output.ScriptPublicKey.Script)
+				addressString = fmt.Sprintf("<Non-standard transaction script public key: %s>", scriptPublicKeyHex)
+			} else {
+				addressString = scriptPublicKeyAddress.EncodeAddress()
+			}
+
+			fmt.Printf("Output %d: \tRecipient: %s \tAmount: %.2f Hoosat\n",
+				index, addressString, float64(output.Value)/float64(constants.SompiPerHoosat))
+
+			allOutputSompi += output.Value
+		}
+		fmt.Println()
+
+		fmt.Printf("Fee:\t%d Sompi\n\n", allInputSompi-allOutputSompi)
+	}
+
+	return nil
+}

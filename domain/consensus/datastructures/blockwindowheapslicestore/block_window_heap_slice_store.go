@@ -1,0 +1,60 @@
+package blockwindowheapslicestore
+
+import (
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/lrucachehashandwindowsizetoblockghostdagdatahashpairs"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/db/database"
+	"github.com/HoosatNetwork/HTND/v2/util/staging"
+	"github.com/pkg/errors"
+)
+
+type blockWindowHeapSliceStore struct {
+	shardID model.StagingShardID
+	cache   *lrucachehashandwindowsizetoblockghostdagdatahashpairs.LRUCache
+}
+
+// New instantiates a new WindowHeapSliceStore
+func New(cacheSize int, preallocate bool) model.WindowHeapSliceStore {
+	return &blockWindowHeapSliceStore{
+		shardID: staging.GenerateShardingID(),
+		cache:   lrucachehashandwindowsizetoblockghostdagdatahashpairs.New(cacheSize, preallocate),
+	}
+}
+
+// Stage stages the given blockStatus for the given blockHash
+func (bss *blockWindowHeapSliceStore) Stage(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, windowSize int, includeTrustedWindow bool, heapSlice []*externalapi.BlockGHOSTDAGDataHashPair) {
+	stagingShard := bss.stagingShard(stagingArea)
+	stagingShard.toAdd[newShardKey(blockHash, windowSize, includeTrustedWindow)] = heapSlice
+}
+
+func (bss *blockWindowHeapSliceStore) IsStaged(stagingArea *model.StagingArea) bool {
+	return bss.stagingShard(stagingArea).isStaged()
+}
+
+func (bss *blockWindowHeapSliceStore) UnstageAll(stagingArea *model.StagingArea) {
+	stagingShard := bss.stagingShard(stagingArea)
+	stagingShard.UnstageAll()
+}
+
+func (bss *blockWindowHeapSliceStore) Get(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, windowSize int, includeTrustedWindow bool) ([]*externalapi.BlockGHOSTDAGDataHashPair, error) {
+	stagingShard := bss.stagingShard(stagingArea)
+
+	heapSlice, ok := stagingShard.toAdd[newShardKey(blockHash, windowSize, includeTrustedWindow)]
+
+	if ok && heapSlice != nil {
+		bss.cache.Add(blockHash, windowSize, includeTrustedWindow, heapSlice)
+		return heapSlice, nil
+	}
+
+	heapSliceCached, ok := bss.cache.Get(blockHash, windowSize, includeTrustedWindow)
+	if ok && heapSliceCached != nil {
+		return heapSliceCached, nil
+	}
+
+	return nil, errors.Wrap(database.ErrNotFound, "Window heap slice not found")
+}
+
+func (bss *blockWindowHeapSliceStore) CacheLen() int {
+	return bss.cache.Len()
+}

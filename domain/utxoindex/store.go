@@ -1,0 +1,983 @@
+package utxoindex
+
+import (
+	"encoding/binary"
+	"math"
+	"strconv"
+	"sync"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/database/binaryserialization"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/db/database"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/logger"
+	"github.com/HoosatNetwork/HTND/v2/util/memory"
+	"github.com/pkg/errors"
+)
+
+var (
+	utxoIndexBucket          = database.MakeBucket([]byte("utxo-index"))
+	utxoIndexCountsBucket    = database.MakeBucket([]byte("utxo-index-counts"))
+	virtualParentsKey        = database.MakeBucket([]byte("")).Key([]byte("utxo-index-virtual-parents"))
+	circulatingSupplyKey     = database.MakeBucket([]byte("")).Key([]byte("utxo-index-circulating-supply"))
+	utxoCountsInitializedKey = database.MakeBucket([]byte("")).Key([]byte("utxo-index-counts-initialized"))
+
+	// needsResetKey is written when the index learns it missed a virtual UTXO diff. The stored
+	// virtual parents keep advancing with every later diff, so without it the startup check would
+	// call the index synced.
+	needsResetKey = database.MakeBucket([]byte("")).Key([]byte("utxo-index-needs-reset"))
+)
+
+func checkedLimitToInt(limit uint32) (int, error) {
+	if strconv.IntSize == 32 && limit > math.MaxInt32 {
+		return 0, errors.Errorf("limit %d exceeds int", limit)
+	}
+	return int(limit), nil
+}
+
+type utxoIndexStore struct {
+	database database.Database
+	toAdd    map[ScriptPublicKeyString]UTXOOutpointEntryPairs
+	toRemove map[ScriptPublicKeyString]UTXOOutpointEntryPairs
+
+	virtualParents []*externalapi.DomainHash
+	// scriptCache    *scriptLRUCache
+	// maxCacheSize   int
+}
+
+func newUTXOIndexStore(database database.Database) *utxoIndexStore {
+	// Default cache size, can be made configurable
+	return &utxoIndexStore{
+		database: database,
+		toAdd:    make(map[ScriptPublicKeyString]UTXOOutpointEntryPairs),
+		toRemove: make(map[ScriptPublicKeyString]UTXOOutpointEntryPairs),
+		// scriptCache:  newScriptLRUCache(defaultCacheSize),
+		// maxCacheSize: defaultCacheSize,
+	}
+}
+
+// // scriptLRUCache is a thread-safe LRU cache for ScriptPublicKeyString -> []UTXOPair
+// type scriptLRUCache struct {
+// 	mu         sync.Mutex
+// 	maxSize    int
+// 	items      map[string]*scriptLRUNode
+// 	head, tail *scriptLRUNode
+// }
+
+// type scriptLRUNode struct {
+// 	key        string
+// 	value      []UTXOPair
+// 	prev, next *scriptLRUNode
+// }
+
+// func newScriptLRUCache(maxSize int) *scriptLRUCache {
+// 	return &scriptLRUCache{
+// 		maxSize: maxSize,
+// 		items:   make(map[string]*scriptLRUNode),
+// 	}
+// }
+
+// func (c *scriptLRUCache) Get(key string) ([]UTXOPair, bool) {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	node, ok := c.items[key]
+// 	if !ok {
+// 		return nil, false
+// 	}
+// 	c.moveToFront(node)
+// 	return node.value, true
+// }
+
+// func (c *scriptLRUCache) Put(key string, value []UTXOPair) {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	// Don't cache large slices to avoid high allocations
+// 	if len(value) > 100 {
+// 		return
+// 	}
+// 	copiedValue := copyUTXOPairs(value)
+// 	if node, ok := c.items[key]; ok {
+// 		node.value = copiedValue
+// 		c.moveToFront(node)
+// 		return
+// 	}
+// 	node := &scriptLRUNode{key: key, value: copiedValue}
+// 	c.items[key] = node
+// 	c.addToFront(node)
+// 	if len(c.items) > c.maxSize {
+// 		c.evict()
+// 	}
+// }
+
+// func (c *scriptLRUCache) Delete(key string) {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	node, ok := c.items[key]
+// 	if !ok {
+// 		return
+// 	}
+// 	c.remove(node)
+// 	delete(c.items, key)
+// }
+
+// func (c *scriptLRUCache) Clear() {
+// 	c.mu.Lock()
+// 	defer c.mu.Unlock()
+// 	c.items = make(map[string]*scriptLRUNode)
+// 	c.head = nil
+// 	c.tail = nil
+// }
+
+// func (c *scriptLRUCache) moveToFront(node *scriptLRUNode) {
+// 	if c.head == node {
+// 		return
+// 	}
+// 	c.remove(node)
+// 	c.addToFront(node)
+// }
+
+// func (c *scriptLRUCache) addToFront(node *scriptLRUNode) {
+// 	node.prev = nil
+// 	node.next = c.head
+// 	if c.head != nil {
+// 		c.head.prev = node
+// 	}
+// 	c.head = node
+// 	if c.tail == nil {
+// 		c.tail = node
+// 	}
+// }
+
+// func (c *scriptLRUCache) remove(node *scriptLRUNode) {
+// 	if node.prev != nil {
+// 		node.prev.next = node.next
+// 	} else {
+// 		c.head = node.next
+// 	}
+// 	if node.next != nil {
+// 		node.next.prev = node.prev
+// 	} else {
+// 		c.tail = node.prev
+// 	}
+// }
+
+// func (c *scriptLRUCache) evict() {
+// 	if c.tail == nil {
+// 		return
+// 	}
+// 	key := c.tail.key
+// 	c.remove(c.tail)
+// 	delete(c.items, key)
+// }
+
+func (uis *utxoIndexStore) add(scriptPublicKey *externalapi.ScriptPublicKey, outpoint *externalapi.DomainOutpoint, utxoEntry externalapi.UTXOEntry) error {
+	key := ScriptPublicKeyString(scriptPublicKey.String())
+	log.Tracef("Adding outpoint %s:%d to scriptPublicKey %s",
+		outpoint.TransactionID, outpoint.Index, key)
+
+	// Invalidate the per-script cache for this key
+	// uis.scriptCache.Delete(string(key))
+
+	// A staged removal and a new addition of the same outpoint cancel only when they describe the
+	// SAME coin. If they differ, this is a replacement rather than a cancellation, and cancelling it
+	// leaves the old value in the database untouched.
+	//
+	// That is not hypothetical: a coin's BlockDAAScore is the DAA score of the block that merged it,
+	// and it changes when a different block takes over merging. The change arrives here as a removal
+	// of the old entry followed by an addition of the new one - Update always applies ToRemove before
+	// ToAdd - so cancelling the pair discarded the new score and kept the stale one. On mainnet that
+	// left 130,857 of 18,276,121 index entries carrying a BlockDAAScore the consensus UTXO set did
+	// not agree with, all of them stale-high. The index is what GetUtxosByAddresses answers from, so
+	// those are the numbers wallets and explorers were shown.
+	//
+	// When they differ, both stay staged: commit deletes before it puts, so the new value lands.
+	if toRemoveOutpointsOfKey, ok := uis.toRemove[key]; ok {
+		if existing, ok := toRemoveOutpointsOfKey[*outpoint]; ok && existing.Equal(utxoEntry) {
+			log.Tracef("Outpoint %s:%d exists in `toRemove` with the same entry. Deleting it from there",
+				outpoint.TransactionID, outpoint.Index)
+			delete(toRemoveOutpointsOfKey, *outpoint)
+			return nil
+		}
+	}
+
+	// Create a UTXOOutpointEntryPairs entry in `toAdd` if it doesn't exist
+	if _, ok := uis.toAdd[key]; !ok {
+		log.Tracef("Creating key %s in `toAdd`", key)
+		uis.toAdd[key] = make(UTXOOutpointEntryPairs)
+	}
+
+	// Return an error if the outpoint already exists in `toAdd`. If the
+	// existing staged entry is identical to the one we are trying to add,
+	// treat it as a no-op.
+	toAddPairsOfKey := uis.toAdd[key]
+	if existing, ok := toAddPairsOfKey[*outpoint]; ok {
+		if existing.Equal(utxoEntry) {
+			return nil
+		}
+		return errors.Errorf("cannot add outpoint %s because it's being added already", outpoint)
+	}
+	toAddPairsOfKey[*outpoint] = utxoEntry
+	log.Tracef("Added outpoint %s:%d to scriptPublicKey %s",
+		outpoint.TransactionID, outpoint.Index, key)
+	return nil
+}
+
+func (uis *utxoIndexStore) remove(scriptPublicKey *externalapi.ScriptPublicKey, outpoint *externalapi.DomainOutpoint, utxoEntry externalapi.UTXOEntry) error {
+	key := ScriptPublicKeyString(scriptPublicKey.String())
+	log.Tracef("Removing outpoint %s:%d from scriptPublicKey %s",
+		outpoint.TransactionID, outpoint.Index, key)
+
+	// Invalidate the per-script cache for this key
+	// uis.scriptCache.Delete(string(key))
+
+	// The mirror of the rule in add: a staged addition and a new removal cancel only when they
+	// describe the same coin. Cancelling a differing pair would drop a removal that was asked for.
+	if toAddPairsOfKey, ok := uis.toAdd[key]; ok {
+		if existing, ok := toAddPairsOfKey[*outpoint]; ok && existing.Equal(utxoEntry) {
+			log.Tracef("Outpoint %s:%d exists in `toAdd` with the same entry. Deleting it from there",
+				outpoint.TransactionID, outpoint.Index)
+			delete(toAddPairsOfKey, *outpoint)
+			return nil
+		}
+	}
+
+	// Create a UTXOOutpointEntryPair in `toRemove` if it doesn't exist
+	if _, ok := uis.toRemove[key]; !ok {
+		log.Tracef("Creating key %s in `toRemove`", key)
+		uis.toRemove[key] = make(UTXOOutpointEntryPairs)
+	}
+
+	// Return an error if the outpoint already exists in `toRemove`.
+	// If the existing staged removal is identical, treat it as a no-op.
+	toRemovePairsOfKey := uis.toRemove[key]
+	if existing, ok := toRemovePairsOfKey[*outpoint]; ok {
+		if existing.Equal(utxoEntry) {
+			return nil
+		}
+		return errors.Errorf("cannot remove outpoint %s because it's being removed already", outpoint)
+	}
+
+	toRemovePairsOfKey[*outpoint] = utxoEntry
+
+	log.Tracef("Removed outpoint %s:%d from scriptPublicKey %s",
+		outpoint.TransactionID, outpoint.Index, key)
+	return nil
+}
+
+func (uis *utxoIndexStore) updateVirtualParents(virtualParents []*externalapi.DomainHash) {
+	uis.virtualParents = virtualParents
+}
+
+func (uis *utxoIndexStore) discard() {
+	for k := range uis.toAdd {
+		delete(uis.toAdd, k)
+	}
+	for k := range uis.toRemove {
+		delete(uis.toRemove, k)
+	}
+	uis.virtualParents = nil
+	// uis.scriptCache.Clear()
+}
+
+func (uis *utxoIndexStore) commit() error {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "utxoIndexStore.commit")
+	defer onEnd()
+
+	dbTransaction, err := uis.database.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dbTransaction.RollbackUnlessClosed() }()
+
+	// The per-address counts and the circulating supply follow what the database holds, not what the
+	// staged changes say. A change can describe a state the index already has: after a rebuild, the
+	// changes queued behind it are applied on top, and the rebuild read virtual after some of them had
+	// happened. Such a change adds a coin already stored or removes one already gone, and counting it
+	// again pushed the counts - even below zero - and the supply away from the coins actually stored.
+	countDeltas := make(map[ScriptPublicKeyString]int64, len(uis.toAdd)+len(uis.toRemove))
+	toAddSompiSupply := uint64(0)
+	toRemoveSompiSupply := uint64(0)
+
+	for scriptPublicKeyString, toRemoveUTXOOutpointEntryPairs := range uis.toRemove {
+		scriptPublicKey := externalapi.NewScriptPublicKeyFromString(string(scriptPublicKeyString))
+		bucket := uis.bucketForScriptPublicKey(scriptPublicKey)
+		toAddUTXOOutpointEntryPairs := uis.toAdd[scriptPublicKeyString]
+		// Invalidate per-script cache for this key
+		// uis.scriptCache.Delete(string(scriptPublicKeyString))
+		for outpointToRemove := range toRemoveUTXOOutpointEntryPairs {
+			if _, isReplaced := toAddUTXOOutpointEntryPairs[outpointToRemove]; isReplaced {
+				// The addition below overwrites it, and accounts for the stored coin there
+				continue
+			}
+			key, err := uis.convertOutpointToKey(bucket, &outpointToRemove)
+			if err != nil {
+				return err
+			}
+			storedAmount, isStored, err := storedUTXOAmount(dbTransaction, key)
+			if err != nil {
+				return err
+			}
+			if !isStored {
+				continue
+			}
+			err = dbTransaction.Delete(key)
+			if err != nil {
+				return err
+			}
+			countDeltas[scriptPublicKeyString]--
+			toRemoveSompiSupply += storedAmount
+		}
+	}
+
+	for scriptPublicKeyString, toAddUTXOOutpointEntryPairs := range uis.toAdd {
+		scriptPublicKey := externalapi.NewScriptPublicKeyFromString(string(scriptPublicKeyString))
+		bucket := uis.bucketForScriptPublicKey(scriptPublicKey)
+		// Invalidate per-script cache for this key
+		// uis.scriptCache.Delete(string(scriptPublicKeyString))
+		for outpointToAdd, utxoEntryToAdd := range toAddUTXOOutpointEntryPairs {
+			key, err := uis.convertOutpointToKey(bucket, &outpointToAdd)
+			if err != nil {
+				return err
+			}
+			storedAmount, isStored, err := storedUTXOAmount(dbTransaction, key)
+			if err != nil {
+				return err
+			}
+			serializedUTXOEntry, err := serializeUTXOEntry(utxoEntryToAdd)
+			if err != nil {
+				return err
+			}
+			err = dbTransaction.Put(key, serializedUTXOEntry)
+			if err != nil {
+				return err
+			}
+			if isStored {
+				toRemoveSompiSupply += storedAmount
+			} else {
+				countDeltas[scriptPublicKeyString]++
+			}
+			toAddSompiSupply += utxoEntryToAdd.Amount()
+		}
+	}
+
+	serializeParentHashes := serializeHashes(uis.virtualParents)
+	err = dbTransaction.Put(virtualParentsKey, serializeParentHashes)
+	if err != nil {
+		return err
+	}
+
+	err = uis.updateCirculatingSompiSupply(dbTransaction, toAddSompiSupply, toRemoveSompiSupply)
+	if err != nil {
+		return err
+	}
+
+	err = uis.applyUTXOCountDeltas(dbTransaction, countDeltas)
+	if err != nil {
+		return err
+	}
+
+	err = dbTransaction.Put(utxoCountsInitializedKey, []byte{1})
+	if err != nil {
+		return err
+	}
+
+	err = dbTransaction.Commit()
+	if err != nil {
+		return err
+	}
+
+	uis.discard()
+	return nil
+}
+
+// storedUTXOAmount returns the amount of the coin stored under key, and whether one is stored.
+func storedUTXOAmount(accessor database.DataAccessor, key *database.Key) (uint64, bool, error) {
+	serializedUTXOEntry, err := accessor.Get(key)
+	if database.IsNotFoundError(err) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	amount, err := deserializeUTXOAmount(serializedUTXOEntry)
+	if err != nil {
+		return 0, false, err
+	}
+	return amount, true, nil
+}
+
+func (uis *utxoIndexStore) addAndCommitOutpointsWithoutTransaction(utxoPairs []*externalapi.OutpointAndUTXOEntryPair) error {
+	var (
+		wg         sync.WaitGroup
+		errChan    = make(chan error, len(utxoPairs))
+		amountChan = make(chan uint64, len(utxoPairs))
+	)
+	countDeltas := make(map[ScriptPublicKeyString]int64)
+	for _, pair := range utxoPairs {
+		countDeltas[ScriptPublicKeyString(pair.UTXOEntry.ScriptPublicKey().String())]++
+	}
+
+	for _, pair := range utxoPairs {
+		wg.Add(1)
+		go func(pair *externalapi.OutpointAndUTXOEntryPair) {
+			defer wg.Done()
+
+			bucket := uis.bucketForScriptPublicKey(pair.UTXOEntry.ScriptPublicKey())
+			key, err := uis.convertOutpointToKey(bucket, pair.Outpoint)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			serializedUTXOEntry, err := serializeUTXOEntry(pair.UTXOEntry)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			err = uis.database.Put(key, serializedUTXOEntry)
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			amountChan <- pair.UTXOEntry.Amount()
+		}(pair)
+	}
+
+	// Wait for all goroutines to finish
+	wg.Wait()
+	close(errChan)
+	close(amountChan)
+
+	// Check for any errors
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	// Sum all amounts
+	toAddSompiSupply := uint64(0)
+	for amount := range amountChan {
+		toAddSompiSupply += amount
+	}
+
+	err := uis.applyUTXOCountDeltasToAccessor(uis.database, countDeltas)
+	if err != nil {
+		return err
+	}
+
+	err = uis.database.Put(utxoCountsInitializedKey, []byte{1})
+	if err != nil {
+		return err
+	}
+
+	// Final update
+	return uis.updateCirculatingSompiSupplyWithoutTransaction(toAddSompiSupply, 0)
+}
+
+func (uis *utxoIndexStore) updateAndCommitVirtualParentsWithoutTransaction(virtualParents []*externalapi.DomainHash) error {
+	serializeParentHashes := serializeHashes(virtualParents)
+	err := uis.database.Put(virtualParentsKey, serializeParentHashes)
+	if err != nil {
+		return err
+	}
+	return uis.database.Put(utxoCountsInitializedKey, []byte{1})
+}
+
+func (uis *utxoIndexStore) bucketForScriptPublicKey(scriptPublicKey *externalapi.ScriptPublicKey) *database.Bucket {
+	return utxoIndexBucket.Bucket(uis.scriptPublicKeyBytes(scriptPublicKey))
+}
+
+func (uis *utxoIndexStore) scriptPublicKeyBytes(scriptPublicKey *externalapi.ScriptPublicKey) []byte {
+	scriptLen := len(scriptPublicKey.Script)
+	if scriptLen <= 64 {
+		var arr [66]byte
+		binary.LittleEndian.PutUint16(arr[:2], scriptPublicKey.Version)
+		copy(arr[2:2+scriptLen], scriptPublicKey.Script)
+		return arr[:2+scriptLen]
+	}
+	scriptPublicKeyBytes := make([]byte, 2+scriptLen)
+	binary.LittleEndian.PutUint16(scriptPublicKeyBytes[:2], scriptPublicKey.Version)
+	copy(scriptPublicKeyBytes[2:], scriptPublicKey.Script)
+	return scriptPublicKeyBytes
+}
+
+func (uis *utxoIndexStore) utxoCountKeyForScriptPublicKey(scriptPublicKey *externalapi.ScriptPublicKey) *database.Key {
+	return utxoIndexCountsBucket.Key(uis.scriptPublicKeyBytes(scriptPublicKey))
+}
+
+func (uis *utxoIndexStore) convertOutpointToKey(bucket *database.Bucket, outpoint *externalapi.DomainOutpoint) (*database.Key, error) {
+	serializedOutpoint, err := serializeOutpoint(outpoint)
+	if err != nil {
+		return nil, err
+	}
+	return bucket.Key(serializedOutpoint), nil
+}
+
+func (uis *utxoIndexStore) convertKeyToOutpoint(key *database.Key) (*externalapi.DomainOutpoint, error) {
+	serializedOutpoint := key.Suffix()
+	return deserializeOutpoint(serializedOutpoint)
+}
+
+func (uis *utxoIndexStore) stagedData() (
+	toAdd []UTXOPair,
+	toRemove []UTXOPair,
+	virtualParents []*externalapi.DomainHash,
+) {
+	// Flatten uis.toAdd map to []UTXOPair
+	for _, utxoPairs := range uis.toAdd {
+		for outpoint, entry := range utxoPairs {
+			toAdd = append(toAdd, UTXOPair{Outpoint: outpoint, Entry: entry})
+		}
+	}
+	// Flatten uis.toRemove map to []UTXOPair
+	for _, utxoPairs := range uis.toRemove {
+		for outpoint, entry := range utxoPairs {
+			toRemove = append(toRemove, UTXOPair{Outpoint: outpoint, Entry: entry})
+		}
+	}
+	return toAdd, toRemove, uis.virtualParents
+}
+
+func (uis *utxoIndexStore) isAnythingStaged() bool {
+	return len(uis.toAdd) > 0 || len(uis.toRemove) > 0
+}
+
+// UTXOPair is a struct for streaming UTXO results efficiently
+type UTXOPair struct {
+	Outpoint externalapi.DomainOutpoint
+	Entry    externalapi.UTXOEntry
+}
+
+func (uis *utxoIndexStore) PaginatedUTXOs(scriptPublicKey *externalapi.ScriptPublicKey, offset uint32, limit uint32, buffer *memory.Block[UTXOPair]) ([]UTXOPair, *memory.Block[UTXOPair], error) {
+	if uis.isAnythingStaged() {
+		return nil, buffer, errors.Errorf("cannot get UTXOs while staging isn't empty")
+	}
+
+	bucket := uis.bucketForScriptPublicKey(scriptPublicKey)
+	cursor, err := uis.database.Cursor(bucket)
+	if err != nil {
+		return nil, buffer, err
+	}
+	defer cursor.Close()
+
+	// offset is the number of UTXOs to skip. Positions are compared with >=: a strict comparison skipped
+	// offset+1 entries, so no request could return an address's first UTXO and paging with offset += limit
+	// dropped one at every page boundary.
+	iterator := uint32(0)
+	count := 0
+	if limit == 0 {
+		for ok := cursor.First(); ok; ok = cursor.Next() {
+			if iterator >= offset {
+				count++
+			}
+			iterator++
+		}
+	} else {
+		count = int(limit)
+	}
+
+	slice := buffer.Slice()[:0]
+	if cap(slice) < count {
+		buffer = memory.Realloc(buffer, count)
+	}
+	slice = buffer.Slice()[:0]
+
+	iterator = uint32(0) // reset iterator to reuse for filling buffer
+	for ok := cursor.First(); ok; ok = cursor.Next() {
+		if iterator >= offset {
+			key, err := cursor.Key()
+			if err != nil {
+				return nil, buffer, err
+			}
+			outpoint, err := uis.convertKeyToOutpoint(key)
+			if err != nil {
+				return nil, buffer, err
+			}
+			serializedUTXOEntry, err := cursor.Value()
+			if err != nil {
+				return nil, buffer, err
+			}
+			utxoEntry, err := deserializeUTXOEntry(serializedUTXOEntry)
+			if err != nil {
+				return nil, buffer, err
+			}
+			slice = append(slice, UTXOPair{Outpoint: *outpoint, Entry: utxoEntry})
+			if limit > 0 {
+				limitInt, err := checkedLimitToInt(limit)
+				if err != nil {
+					return nil, buffer, err
+				}
+				if len(slice) >= limitInt {
+					break
+				}
+			}
+		}
+		iterator++
+	}
+	return slice, buffer, nil
+}
+
+// UTXOs streams UTXOs for a ScriptPublicKey directly into a slice (allocation-efficient)
+func (uis *utxoIndexStore) UTXOs(scriptPublicKey *externalapi.ScriptPublicKey, limit uint32, buffer *memory.Block[UTXOPair]) ([]UTXOPair, *memory.Block[UTXOPair], error) {
+	if uis.isAnythingStaged() {
+		return nil, buffer, errors.Errorf("cannot get UTXOs while staging isn't empty")
+	}
+
+	// scriptKeyString := scriptPublicKey.String()
+	// if cachedPairs, ok := uis.scriptCache.Get(scriptKeyString); ok {
+	// 	return cachedPairs, nil
+	// }
+
+	bucket := uis.bucketForScriptPublicKey(scriptPublicKey)
+	cursor, err := uis.database.Cursor(bucket)
+	if err != nil {
+		return nil, buffer, err
+	}
+	defer cursor.Close()
+
+	// Sizing pass: the exact count, without a first cursor scan to compute it. applyUTXOCountDeltas
+	// already maintains this per-script count in the same commit as the entries themselves (see
+	// utxoCountKeyForScriptPublicKey), specifically so a caller that needs the count doesn't have to
+	// scan for it - this just wasn't using it, and a full scan just to size the buffer before the real
+	// (also full) fill scan doubled this function's cost. Profiled at ~15% of a busy node's total CPU
+	// under ordinary GetBalancesByAddresses/GetUsableAddresses traffic, competing directly with block
+	// processing for the same CPU and GC budget.
+	count := 0
+	if limit == 0 {
+		countBytes, err := uis.database.Get(uis.utxoCountKeyForScriptPublicKey(scriptPublicKey))
+		if err != nil {
+			if !database.IsNotFoundError(err) {
+				return nil, buffer, err
+			}
+		} else {
+			count64, err := binaryserialization.DeserializeUint64(countBytes)
+			if err != nil {
+				return nil, buffer, err
+			}
+			if count64 > math.MaxInt {
+				return nil, buffer, errors.Errorf("utxo count %d for scriptPublicKey %s exceeds int",
+					count64, scriptPublicKey.String())
+			}
+			count = int(count64)
+		}
+	} else {
+		count = int(limit)
+	}
+
+	slice := buffer.Slice()[:0]
+	// Preallocate exactly to avoid reallocations during append
+	if cap(slice) < count {
+		buffer = memory.Realloc(buffer, count) // reallocate if existing capacity is insufficient
+	}
+	slice = buffer.Slice()[:0]
+
+	// Second pass: fill
+	for ok := cursor.First(); ok; ok = cursor.Next() {
+		key, err := cursor.Key()
+		if err != nil {
+			return nil, buffer, err
+		}
+		outpoint, err := uis.convertKeyToOutpoint(key)
+		if err != nil {
+			return nil, buffer, err
+		}
+		serializedUTXOEntry, err := cursor.Value()
+		if err != nil {
+			return nil, buffer, err
+		}
+		utxoEntry, err := deserializeUTXOEntry(serializedUTXOEntry)
+		if err != nil {
+			return nil, buffer, err
+		}
+		slice = append(slice, UTXOPair{Outpoint: *outpoint, Entry: utxoEntry})
+		if limit > 0 {
+			limitInt, err := checkedLimitToInt(limit)
+			if err != nil {
+				return nil, buffer, err
+			}
+			if len(slice) >= limitInt {
+				break
+			}
+		}
+	}
+
+	// uis.scriptCache.Put(scriptKeyString, buffer)
+	return slice, buffer, nil
+}
+
+// UTXOs streams UTXOs for a ScriptPublicKey directly into a slice (allocation-efficient)
+func (uis *utxoIndexStore) HasUTXOs(scriptPublicKey *externalapi.ScriptPublicKey) (bool, error) {
+	if uis.isAnythingStaged() {
+		return false, errors.Errorf("cannot get UTXOs while staging isn't empty")
+	}
+
+	return uis.database.Has(uis.utxoCountKeyForScriptPublicKey(scriptPublicKey))
+}
+
+// GetBalance returns the total balance for a ScriptPublicKey without allocating full UTXO entries
+func (uis *utxoIndexStore) GetBalance(scriptPublicKey *externalapi.ScriptPublicKey) (uint64, error) {
+	if uis.isAnythingStaged() {
+		return 0, errors.Errorf("cannot get balance while staging isn't empty")
+	}
+
+	bucket := uis.bucketForScriptPublicKey(scriptPublicKey)
+	cursor, err := uis.database.Cursor(bucket)
+	if err != nil {
+		return 0, err
+	}
+	defer cursor.Close()
+
+	var balance uint64
+	for ok := cursor.First(); ok; ok = cursor.Next() {
+		serializedUTXOEntry, err := cursor.Value()
+		if err != nil {
+			return 0, err
+		}
+		amount, err := deserializeUTXOAmount(serializedUTXOEntry)
+		if err != nil {
+			return 0, err
+		}
+		balance += amount
+	}
+	return balance, nil
+}
+
+func (uis *utxoIndexStore) markNeedsReset() error {
+	return uis.database.Put(needsResetKey, []byte{1})
+}
+
+func (uis *utxoIndexStore) needsReset() (bool, error) {
+	return uis.database.Has(needsResetKey)
+}
+
+func (uis *utxoIndexStore) getVirtualParents() ([]*externalapi.DomainHash, error) {
+	if uis.isAnythingStaged() {
+		return nil, errors.Errorf("cannot get the virtual parents while staging isn't empty")
+	}
+
+	serializedHashes, err := uis.database.Get(virtualParentsKey)
+	// if database.IsNotFoundError(err) {
+	// 	log.Infof("getVirtualParents failed to retrieve with %s\n", virtualParentsKey)
+	// 	return nil, err
+	// }
+	if err != nil {
+		return nil, err
+	}
+
+	return deserializeHashes(serializedHashes)
+}
+
+func (uis *utxoIndexStore) deleteAll() error {
+	// First we delete the virtual parents, so if anything goes wrong, the UTXO index will be marked as "not synced"
+	// and will be reset.
+	err := uis.database.Delete(virtualParentsKey)
+	if err != nil {
+		return err
+	}
+
+	// Safe to clear now: with the virtual parents gone, an interrupted reset is retried anyway.
+	err = uis.database.Delete(needsResetKey)
+	if err != nil {
+		return err
+	}
+
+	err = uis.database.Delete(circulatingSupplyKey)
+	if err != nil {
+		return err
+	}
+
+	err = uis.database.Delete(utxoCountsInitializedKey)
+	if err != nil {
+		return err
+	}
+
+	countsCursor, err := uis.database.Cursor(utxoIndexCountsBucket)
+	if err != nil {
+		return err
+	}
+	defer countsCursor.Close()
+	for countsCursor.Next() {
+		key, err := countsCursor.Key()
+		if err != nil {
+			return err
+		}
+
+		err = uis.database.Delete(key)
+		if err != nil {
+			return err
+		}
+	}
+
+	cursor, err := uis.database.Cursor(utxoIndexBucket)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+	for cursor.Next() {
+		key, err := cursor.Key()
+		if err != nil {
+			return err
+		}
+
+		err = uis.database.Delete(key)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Clear both caches after deleting all data
+	// uis.scriptCache.Clear()
+
+	return nil
+}
+
+func (uis *utxoIndexStore) initializeCirculatingSompiSupply() error {
+	cursor, err := uis.database.Cursor(utxoIndexBucket)
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+
+	circulatingSompiSupplyInDatabase := uint64(0)
+	for cursor.Next() {
+		serializedUTXOEntry, err := cursor.Value()
+		if err != nil {
+			return err
+		}
+		utxoAmount, err := deserializeUTXOAmount(serializedUTXOEntry)
+		if err != nil {
+			return err
+		}
+
+		circulatingSompiSupplyInDatabase += utxoAmount
+	}
+
+	err = uis.database.Put(
+		circulatingSupplyKey,
+		binaryserialization.SerializeUint64(circulatingSompiSupplyInDatabase),
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (uis *utxoIndexStore) updateCirculatingSompiSupply(dbTransaction database.Transaction, toAddSompiSupply uint64, toRemoveSompiSupply uint64) error {
+	if toAddSompiSupply != toRemoveSompiSupply {
+		circulatingSupplyBytes, err := dbTransaction.Get(circulatingSupplyKey)
+		if database.IsNotFoundError(err) {
+			log.Infof("updateCirculatingSompiSupply failed to retrieve with %s\n", circulatingSupplyKey)
+			return err
+		}
+		if err != nil {
+			return err
+		}
+
+		circulatingSupply, err := binaryserialization.DeserializeUint64(circulatingSupplyBytes)
+		if err != nil {
+			return err
+		}
+		err = dbTransaction.Put(
+			circulatingSupplyKey,
+			binaryserialization.SerializeUint64(circulatingSupply+toAddSompiSupply-toRemoveSompiSupply),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (uis *utxoIndexStore) updateCirculatingSompiSupplyWithoutTransaction(toAddSompiSupply uint64, toRemoveSompiSupply uint64) error {
+	if toAddSompiSupply != toRemoveSompiSupply {
+		circulatingSupplyBytes, err := uis.database.Get(circulatingSupplyKey)
+		if database.IsNotFoundError(err) {
+			log.Infof("updateCirculatingSompiSupplyWithoutTransaction failed to retrieve with %s\n", circulatingSupplyKey)
+			return err
+		}
+		if err != nil {
+			return err
+		}
+
+		circulatingSupply, err := binaryserialization.DeserializeUint64(circulatingSupplyBytes)
+		if err != nil {
+			return err
+		}
+		err = uis.database.Put(
+			circulatingSupplyKey,
+			binaryserialization.SerializeUint64(circulatingSupply+toAddSompiSupply-toRemoveSompiSupply),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (uis *utxoIndexStore) getCirculatingSompiSupply() (uint64, error) {
+	if uis.isAnythingStaged() {
+		return 0, errors.Errorf("cannot get circulatingSupply while staging isn't empty")
+	}
+	circulatingSupply, err := uis.database.Get(circulatingSupplyKey)
+	if database.IsNotFoundError(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return binaryserialization.DeserializeUint64(circulatingSupply)
+}
+
+func (uis *utxoIndexStore) applyUTXOCountDeltas(tx database.Transaction, countDeltas map[ScriptPublicKeyString]int64) error {
+	return uis.applyUTXOCountDeltasToAccessor(tx, countDeltas)
+}
+
+func (uis *utxoIndexStore) applyUTXOCountDeltasToAccessor(accessor database.DataAccessor, countDeltas map[ScriptPublicKeyString]int64) error {
+	for scriptPublicKeyString, delta := range countDeltas {
+		if delta == 0 {
+			continue
+		}
+
+		scriptPublicKey := externalapi.NewScriptPublicKeyFromString(string(scriptPublicKeyString))
+		countKey := uis.utxoCountKeyForScriptPublicKey(scriptPublicKey)
+
+		currentCount := uint64(0)
+		countBytes, err := accessor.Get(countKey)
+		if err != nil {
+			if !database.IsNotFoundError(err) {
+				return err
+			}
+		} else {
+			currentCount, err = binaryserialization.DeserializeUint64(countBytes)
+			if err != nil {
+				return err
+			}
+		}
+
+		if currentCount > math.MaxInt64 {
+			return errors.Errorf("utxo count %d exceeds int64", currentCount)
+		}
+		newCount := int64(currentCount) + delta
+		if newCount < 0 {
+			log.Debugf("utxo count for scriptPublicKey %s became negative with current count %d and delta %d", scriptPublicKey.String(), currentCount, delta)
+		}
+
+		if newCount <= 0 {
+			err = accessor.Delete(countKey)
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
+		err = accessor.Put(countKey, binaryserialization.SerializeUint64(uint64(newCount)))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}

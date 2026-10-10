@@ -1,0 +1,87 @@
+name: Race
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  race_test:
+    runs-on: ubuntu-latest
+    # Without this the job inherits the 6-hour default, so anything that kills the run - the race
+    # detector's memory use above all - surfaces as a bare SIGTERM hours later instead of a timeout.
+    timeout-minutes: 90
+    env:
+      GOFLAGS: -tags=ci
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: [ master, latest ]
+    name: Race detection on ${{ matrix.branch }}
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Set scheduled branch name
+        shell: bash
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "${{ matrix.branch }}" == "master" ]; then
+            echo "run_on=master" >> $GITHUB_ENV
+          fi
+          if [ "${{ matrix.branch }}" == "latest" ]; then
+            # || true because this step runs under `bash -eo pipefail`: with no vX.Y.Z-dev branch on
+            # origin, grep exits 1, pipefail promotes that to the whole pipeline, and -e kills the
+            # step - before the fallback below, which exists for precisely that case, can run.
+            branch=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin | grep -E '^origin/v[0-9]+\.[0-9]+\.[0-9]+-dev$' | sed 's#^origin/##' | sort -V | tail -n1 || true)
+            if [ -n "${branch}" ]; then
+              echo "run_on=${branch}" >> $GITHUB_ENV
+            else
+              echo "run_on=master" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Set manual branch name
+        shell: bash
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "run_on=${{ github.ref_name }}" >> $GITHUB_ENV
+
+      - name: Test with race detector
+        shell: bash
+        run: |
+          git checkout "${{ env.run_on }}"
+          git status
+          free -m
+          # -p 2 rather than the default one test binary per core. A race-instrumented binary costs
+          # roughly ten times the memory of a plain one, and several of this repo's consensus
+          # packages hold a full DAG in memory, so four of them at once is what exhausts the runner.
+          #
+          # Each line is stamped with the wall-clock time it was printed. `go test` reports how long
+          # each package took but nothing about when, so a run that ends in a bare SIGTERM gives no
+          # way to tell a job that died ten minutes in from one that sat stuck for hours - which is
+          # the first thing worth knowing about this job's exit 143. pipefail is on, so the loop does
+          # not swallow a test failure.
+          go test -timeout 20m -race -p 2 ./... 2>&1 \
+            | while IFS= read -r line; do printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$line"; done
+
+      # The 20m -timeout above only covers running a test binary. It does not cover compiling and
+      # linking them, which under -race is where this job spends most of its memory, and a runner
+      # deep into swap can stall there for hours with no timeout of any kind applying. If the kernel
+      # killed something, this says so; if it did not, the stall was not memory and the timestamps
+      # above say where it was.
+      - name: Report memory pressure and any OOM kills
+        if: always()
+        shell: bash
+        run: |
+          free -m || true
+          sudo dmesg 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -20 \
+            || echo "no OOM kills recorded in dmesg"

@@ -1,0 +1,193 @@
+package blockrelay
+
+import (
+	"strconv"
+
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	peerpkg "github.com/HoosatNetwork/HTND/v2/app/protocol/peer"
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/protocolerrors"
+	"github.com/HoosatNetwork/HTND/v2/domain"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/config"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/router"
+)
+
+// PruningPointAndItsAnticoneRequestsContext is the interface for the context needed for the HandlePruningPointAndItsAnticoneRequests flow.
+type PruningPointAndItsAnticoneRequestsContext interface {
+	Domain() domain.Domain
+	Config() *config.Config
+}
+
+// pruningPointAnticoneSlot allows one pruning point anticone serve to do its work at a time. It is held while the
+// anticone is computed and while each batch is sent, but not while the flow waits for the syncee to ask for the next
+// batch: that wait has no timeout, and holding the slot through it let one syncee that went quiet make every other
+// syncee's request fail as busy for as long as it stayed connected.
+var pruningPointAnticoneSlot = make(chan struct{}, 1)
+
+// HandlePruningPointAndItsAnticoneRequests listens to appmessage.MsgRequestPruningPointAndItsAnticone messages and sends
+// the pruning point and its anticone to the requesting peer.
+func HandlePruningPointAndItsAnticoneRequests(context PruningPointAndItsAnticoneRequestsContext, incomingRoute *router.Route,
+	outgoingRoute *router.Route, peer *peerpkg.Peer,
+) error {
+	for {
+		err := func() error {
+			_, err := incomingRoute.Dequeue()
+			if err != nil {
+				return err
+			}
+
+			select {
+			case pruningPointAnticoneSlot <- struct{}{}:
+			default:
+				return protocolerrors.Errorf(false, "node is busy with other pruning point anticone requests")
+			}
+			holdsSlot := true
+			defer func() {
+				if holdsSlot {
+					<-pruningPointAnticoneSlot
+				}
+			}()
+
+			log.Debugf("Got request for pruning point and its anticone from %s", peer)
+
+			pruningPointHeaders, err := context.Domain().Consensus().PruningPointHeaders()
+			if err != nil {
+				return err
+			}
+
+			msgPruningPointHeaders := make([]*appmessage.MsgBlockHeader, len(pruningPointHeaders))
+			for i := range pruningPointHeaders {
+				msgPruningPointHeaders[i] = appmessage.DomainBlockHeaderToBlockHeader(pruningPointHeaders[i])
+			}
+
+			err = outgoingRoute.Enqueue(appmessage.NewMsgPruningPoints(msgPruningPointHeaders))
+			if err != nil {
+				return err
+			}
+
+			pointAndItsAnticone, err := context.Domain().Consensus().PruningPointAndItsAnticone()
+			if err != nil {
+				return err
+			}
+
+			windowSize := context.Config().NetParams().DifficultyAdjustmentWindowSizeForCurrentVersion()
+			daaWindowBlocks := make([]*externalapi.TrustedDataDataDAAHeader, 0, windowSize)
+			daaWindowHashesToIndex := make(map[externalapi.DomainHash]int, windowSize)
+			trustedDataDAABlockIndexes := make(map[externalapi.DomainHash][]uint64)
+
+			ghostdagData := make([]*externalapi.BlockGHOSTDAGDataHashPair, 0)
+			ghostdagDataHashToIndex := make(map[externalapi.DomainHash]int)
+			trustedDataGHOSTDAGDataIndexes := make(map[externalapi.DomainHash][]uint64)
+			for i := range pointAndItsAnticone {
+				blockDAAWindowHashes, err := context.Domain().Consensus().BlockDAAWindowHashes(pointAndItsAnticone[i])
+				if err != nil {
+					return err
+				}
+
+				trustedDataDAABlockIndexes[*pointAndItsAnticone[i]] = make([]uint64, 0, windowSize)
+				for x := range blockDAAWindowHashes {
+					index, exists := daaWindowHashesToIndex[*blockDAAWindowHashes[x]]
+					if !exists {
+						pointIndex, err := strconv.ParseUint(strconv.Itoa(i), 10, 64)
+						if err != nil {
+							return err
+						}
+						trustedDataDataDAAHeader, err := context.Domain().Consensus().TrustedDataDataDAAHeader(pointAndItsAnticone[i], blockDAAWindowHashes[x], pointIndex)
+						if err != nil {
+							return err
+						}
+						daaWindowBlocks = append(daaWindowBlocks, trustedDataDataDAAHeader)
+						index = len(daaWindowBlocks) - 1
+						daaWindowHashesToIndex[*blockDAAWindowHashes[x]] = index
+					}
+
+					// Prevent integer overflow when converting index to uint64
+					if index < 0 {
+						return protocolerrors.Errorf(false, "index %d is negative, cannot convert to uint64", index)
+					}
+					indexUint64, err := strconv.ParseUint(strconv.Itoa(index), 10, 64)
+					if err != nil {
+						return err
+					}
+					trustedDataDAABlockIndexes[*pointAndItsAnticone[i]] = append(trustedDataDAABlockIndexes[*pointAndItsAnticone[i]], indexUint64)
+				}
+
+				ghostdagDataBlockHashes, err := context.Domain().Consensus().TrustedBlockAssociatedGHOSTDAGDataBlockHashes(pointAndItsAnticone[i])
+				if err != nil {
+					return err
+				}
+
+				trustedDataGHOSTDAGDataIndexes[*pointAndItsAnticone[i]] = make([]uint64, 0, context.Config().NetParams().KForCurrentVersion())
+				for y := range ghostdagDataBlockHashes {
+					index, exists := ghostdagDataHashToIndex[*ghostdagDataBlockHashes[y]]
+					if !exists {
+						data, err := context.Domain().Consensus().TrustedGHOSTDAGData(ghostdagDataBlockHashes[y])
+						if err != nil {
+							return err
+						}
+						ghostdagData = append(ghostdagData, &externalapi.BlockGHOSTDAGDataHashPair{
+							Hash:         ghostdagDataBlockHashes[y],
+							GHOSTDAGData: data,
+						})
+						index = len(ghostdagData) - 1
+						ghostdagDataHashToIndex[*ghostdagDataBlockHashes[y]] = index
+					}
+
+					indexUint64, err := strconv.ParseUint(strconv.Itoa(index), 10, 64)
+					if err != nil {
+						return err
+					}
+					trustedDataGHOSTDAGDataIndexes[*pointAndItsAnticone[i]] = append(trustedDataGHOSTDAGDataIndexes[*pointAndItsAnticone[i]], indexUint64)
+				}
+			}
+
+			err = outgoingRoute.Enqueue(appmessage.DomainTrustedDataToTrustedData(daaWindowBlocks, ghostdagData))
+			if err != nil {
+				return err
+			}
+			for i := range pointAndItsAnticone {
+				block, found, err := context.Domain().Consensus().GetBlock(pointAndItsAnticone[i])
+				if err != nil {
+					return err
+				}
+
+				if !found {
+					return protocolerrors.Errorf(false, "pruning point anticone block %s not found", pointAndItsAnticone[i])
+				}
+
+				err = outgoingRoute.Enqueue(appmessage.DomainBlockWithTrustedDataToBlockWithTrustedDataV4(block, trustedDataDAABlockIndexes[*pointAndItsAnticone[i]], trustedDataGHOSTDAGDataIndexes[*pointAndItsAnticone[i]]))
+				if err != nil {
+					return err
+				}
+
+				if (i+1)%getIBDBatchSize() == 0 {
+					// No timeout here, as we don't care if the syncee takes its time computing,
+					// since it only blocks this dedicated flow - so the slot is released for the wait
+					<-pruningPointAnticoneSlot
+					holdsSlot = false
+					message, err := incomingRoute.Dequeue()
+					if err != nil {
+						return err
+					}
+					pruningPointAnticoneSlot <- struct{}{}
+					holdsSlot = true
+					if _, ok := message.(*appmessage.MsgRequestNextPruningPointAndItsAnticoneBlocks); !ok {
+						return protocolerrors.Errorf(true, "received unexpected message type. "+
+							"expected: %s, got: %s", appmessage.CmdRequestNextPruningPointAndItsAnticoneBlocks, message.Command())
+					}
+				}
+			}
+
+			err = outgoingRoute.Enqueue(appmessage.NewMsgDoneBlocksWithTrustedData())
+			if err != nil {
+				return err
+			}
+
+			log.Debugf("Sent pruning point and its anticone to %s", peer)
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+}

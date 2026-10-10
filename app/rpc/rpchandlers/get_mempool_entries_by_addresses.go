@@ -1,0 +1,121 @@
+package rpchandlers
+
+import (
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	"github.com/HoosatNetwork/HTND/v2/app/rpc/rpccontext"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/txscript"
+
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/router"
+	"github.com/HoosatNetwork/HTND/v2/util"
+)
+
+// HandleGetMempoolEntriesByAddresses handles the respectively named RPC command
+func HandleGetMempoolEntriesByAddresses(context *rpccontext.Context, _ *router.Router, request appmessage.Message) (appmessage.Message, error) {
+	getMempoolEntriesByAddressesRequest := request.(*appmessage.GetMempoolEntriesByAddressesRequestMessage)
+
+	mempoolEntriesByAddresses := make([]*appmessage.MempoolEntryByAddress, 0, len(getMempoolEntriesByAddressesRequest.Addresses))
+
+	sendingInTransactionPool, receivingInTransactionPool, sendingInOrphanPool, receivingInOrphanPool, err := context.Domain.MiningManager().GetTransactionsByAddressesNoClone(!getMempoolEntriesByAddressesRequest.FilterTransactionPool, getMempoolEntriesByAddressesRequest.IncludeOrphanPool)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, addressString := range getMempoolEntriesByAddressesRequest.Addresses {
+		address, err := util.DecodeAddress(addressString, context.Config.NetParams().Prefix)
+		if err != nil {
+			errorMessage := &appmessage.GetMempoolEntriesByAddressesResponseMessage{}
+			errorMessage.Error = appmessage.RPCErrorf("Could not decode address '%s': %s", addressString, err)
+			return errorMessage, nil
+		}
+
+		sending := make([]*appmessage.MempoolEntry, 0, 2)
+		receiving := make([]*appmessage.MempoolEntry, 0, 2)
+
+		scriptPublicKey, err := txscript.PayToAddrScript(address)
+		if err != nil {
+			errorMessage := &appmessage.GetMempoolEntriesByAddressesResponseMessage{}
+			errorMessage.Error = appmessage.RPCErrorf("Could not extract scriptPublicKey from address '%s': %s", addressString, err)
+			return errorMessage, nil
+		}
+		scriptPublicKeyString := scriptPublicKey.String()
+
+		if !getMempoolEntriesByAddressesRequest.FilterTransactionPool {
+
+			for _, transaction := range sendingInTransactionPool[scriptPublicKeyString] {
+				rpcTransaction := appmessage.DomainTransactionToRPCTransaction(transaction)
+				err := context.PopulateTransactionWithVerboseData(rpcTransaction, transaction, nil)
+				if err != nil {
+					return nil, err
+				}
+
+				sending = append(sending, &appmessage.MempoolEntry{
+					Fee:         transaction.LoadFee(),
+					Transaction: rpcTransaction,
+					IsOrphan:    false,
+				},
+				)
+			}
+
+			for _, transaction := range receivingInTransactionPool[scriptPublicKeyString] {
+				rpcTransaction := appmessage.DomainTransactionToRPCTransaction(transaction)
+				err := context.PopulateTransactionWithVerboseData(rpcTransaction, transaction, nil)
+				if err != nil {
+					return nil, err
+				}
+
+				receiving = append(receiving, &appmessage.MempoolEntry{
+					Fee:         transaction.LoadFee(),
+					Transaction: rpcTransaction,
+					IsOrphan:    false,
+				},
+				)
+			}
+		}
+		if getMempoolEntriesByAddressesRequest.IncludeOrphanPool {
+
+			for _, transaction := range sendingInOrphanPool[scriptPublicKeyString] {
+				rpcTransaction := appmessage.DomainTransactionToRPCTransaction(transaction)
+				err := context.PopulateTransactionWithVerboseData(rpcTransaction, transaction, nil)
+				if err != nil {
+					return nil, err
+				}
+
+				sending = append(sending, &appmessage.MempoolEntry{
+					Fee:         transaction.LoadFee(),
+					Transaction: rpcTransaction,
+					IsOrphan:    true,
+				},
+				)
+			}
+
+			for _, transaction := range receivingInOrphanPool[scriptPublicKeyString] {
+				rpcTransaction := appmessage.DomainTransactionToRPCTransaction(transaction)
+				err := context.PopulateTransactionWithVerboseData(rpcTransaction, transaction, nil)
+				if err != nil {
+					return nil, err
+				}
+
+				receiving = append(receiving, &appmessage.MempoolEntry{
+					Fee:         transaction.LoadFee(),
+					Transaction: rpcTransaction,
+					IsOrphan:    true,
+				},
+				)
+			}
+
+		}
+
+		if len(sending) > 0 || len(receiving) > 0 {
+			mempoolEntriesByAddresses = append(
+				mempoolEntriesByAddresses,
+				&appmessage.MempoolEntryByAddress{
+					Address:   addressString,
+					Sending:   sending,
+					Receiving: receiving,
+				},
+			)
+		}
+	}
+
+	return appmessage.NewGetMempoolEntriesByAddressesResponseMessage(mempoolEntriesByAddresses), nil
+}

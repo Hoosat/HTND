@@ -1,0 +1,16 @@
+package model
+
+import "github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+
+// ReachabilityDataStore represents a store of ReachabilityData
+type ReachabilityDataStore interface {
+	StageReachabilityData(stagingArea *StagingArea, blockHash *externalapi.DomainHash, reachabilityData ReachabilityData)
+	StageReachabilityReindexRoot(stagingArea *StagingArea, reachabilityReindexRoot *externalapi.DomainHash)
+	IsStaged(stagingArea *StagingArea) bool
+	ReachabilityData(dbContext DBReader, stagingArea *StagingArea, blockHash *externalapi.DomainHash) (ReachabilityData, error)
+	HasReachabilityData(dbContext DBReader, stagingArea *StagingArea, blockHash *externalapi.DomainHash) (bool, error)
+	ReachabilityReindexRoot(dbContext DBReader, stagingArea *StagingArea) (*externalapi.DomainHash, error)
+	Delete(dbContext DBWriter) error
+	UnstageAll(stagingArea *StagingArea)
+	CacheLen() int
+}

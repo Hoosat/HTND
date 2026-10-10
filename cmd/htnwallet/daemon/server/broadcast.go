@@ -1,0 +1,104 @@
+package server
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	"github.com/HoosatNetwork/HTND/v2/cmd/htnwallet/daemon/pb"
+	"github.com/HoosatNetwork/HTND/v2/cmd/htnwallet/libhtnwallet"
+	"github.com/HoosatNetwork/HTND/v2/cmd/htnwallet/libhtnwallet/serialization"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/rpcclient"
+	"github.com/pkg/errors"
+)
+
+func (s *server) Broadcast(_ context.Context, request *pb.BroadcastRequest) (*pb.BroadcastResponse, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	txIDs, err := s.broadcast(request.Transactions, request.IsDomain, request.AllowOrphan, request.IsHighPriority)
+	if err != nil {
+		return nil, err
+	}
+
+	return &pb.BroadcastResponse{TxIDs: txIDs}, nil
+}
+
+func (s *server) broadcast(transactions [][]byte, isDomain bool, allowOrphan bool, isHighPriority *bool) ([]string, error) {
+	txIDs := make([]string, len(transactions))
+	var tx *externalapi.DomainTransaction
+	var err error
+
+	for i, transaction := range transactions {
+
+		if isDomain {
+			tx, err = serialization.DeserializeDomainTransaction(transaction)
+			if err != nil {
+				return nil, withSubmittedTransactionIDs(err, txIDs[:i])
+			}
+		} else if !isDomain { // default in proto3 is false
+			tx, err = libhtnwallet.ExtractTransaction(transaction, s.keysFile.ECDSA)
+			if err != nil {
+				return nil, withSubmittedTransactionIDs(err, txIDs[:i])
+			}
+		}
+
+		txIDs[i], err = sendTransaction(s.rpcClient, tx, allowOrphan, isHighPriority)
+		if err != nil {
+			if shouldReleaseUsedOutpointsOnBroadcastError(err) {
+				s.releaseUsedOutpoints(tx)
+			}
+			return nil, withSubmittedTransactionIDs(err, txIDs[:i])
+		}
+
+		for _, input := range tx.Inputs {
+			s.usedOutpoints[input.PreviousOutpoint] = time.Now()
+		}
+	}
+
+	s.forceSync()
+	return txIDs, nil
+}
+
+// withSubmittedTransactionIDs adds to a broadcast error the IDs of the transactions of the same request that were
+// already submitted. They are in the node's mempool and will be mined, but the error replaces the response that would
+// have listed them, so without this the caller cannot tell which payments went out.
+func withSubmittedTransactionIDs(err error, submittedTxIDs []string) error {
+	if len(submittedTxIDs) == 0 {
+		return err
+	}
+	return errors.Wrapf(err, "%d transaction(s) of this request were already submitted and may be in the node's "+
+		"mempool (%s)", len(submittedTxIDs), strings.Join(submittedTxIDs, ", "))
+}
+
+func shouldReleaseUsedOutpointsOnBroadcastError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errString := strings.ToLower(err.Error())
+	return strings.Contains(errString, "rejected transaction") ||
+		strings.Contains(errString, "already spent by transaction") ||
+		strings.Contains(errString, "compound transaction rate limit exceeded")
+}
+
+func (s *server) releaseUsedOutpoints(tx *externalapi.DomainTransaction) {
+	if tx == nil {
+		return
+	}
+
+	for _, input := range tx.Inputs {
+		delete(s.usedOutpoints, input.PreviousOutpoint)
+	}
+}
+
+func sendTransaction(client *rpcclient.RPCClient, tx *externalapi.DomainTransaction, allowOrphan bool, isHighPriority *bool) (string, error) {
+	submitTransactionResponse, err := client.SubmitTransactionWithPriority(appmessage.DomainTransactionToRPCTransaction(tx), consensushashing.TransactionID(tx).String(), allowOrphan, isHighPriority)
+	if err != nil {
+		return "", errors.Wrapf(err, "error submitting transaction")
+	}
+	return submitTransactionResponse.TransactionID, nil
+}

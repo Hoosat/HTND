@@ -1,0 +1,442 @@
+package externalapi
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"unsafe"
+
+	"github.com/pkg/errors"
+)
+
+var scriptPublicKeyStringPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 0, 1024)
+		return &buffer
+	},
+}
+
+// DomainTransaction represents a Hoosat transaction
+type DomainTransaction struct {
+	Version      uint16
+	Inputs       []*DomainTransactionInput
+	Outputs      []*DomainTransactionOutput
+	LockTime     uint64
+	SubnetworkID DomainSubnetworkID
+	Gas          uint64
+	Payload      []byte
+
+	// Fee is populated by in-context validation while other goroutines may read the transaction
+	// (RPC handlers read mempool transactions after the mempool lock is released). Setting it in a
+	// composite literal is fine; anywhere else go through LoadFee and StoreFee.
+	Fee uint64
+	// Mass is populated lazily by the transaction validator, including on
+	// transactions shared between goroutines (the dagconfig genesis coinbase
+	// is validated by every consensus instance built from the same params).
+	// Setting it in a composite literal is fine; anywhere else go through
+	// LoadMass and StoreMass.
+	Mass uint64
+
+	// ID is a field that is used to cache the transaction ID.
+	// Always use consensushashing.TransactionID instead of accessing this field directly.
+	// Setting it in a composite literal is fine; anywhere else go through
+	// CachedID and SetCachedID, because the cache is filled lazily on
+	// transactions that are shared between goroutines (the dagconfig genesis
+	// coinbase is hashed by every consensus instance built from the same params).
+	ID *DomainTransactionID
+}
+
+// CachedID returns the cached transaction ID, or nil if it isn't cached.
+func (tx *DomainTransaction) CachedID() *DomainTransactionID {
+	return (*DomainTransactionID)(atomic.LoadPointer(tx.idPointer()))
+}
+
+// SetCachedID caches the transaction ID; nil clears the cache. Callers that
+// mutate a transaction must clear it, since the ID depends on the contents.
+func (tx *DomainTransaction) SetCachedID(id *DomainTransactionID) {
+	atomic.StorePointer(tx.idPointer(), unsafe.Pointer(id))
+}
+
+// idPointer lets ID stay a plain exported pointer field, which keeps composite
+// literals and reflect.DeepEqual working, while its accessors are atomic.
+func (tx *DomainTransaction) idPointer() *unsafe.Pointer {
+	return (*unsafe.Pointer)(unsafe.Pointer(&tx.ID))
+}
+
+// LoadMass returns the transaction mass, or 0 if it hasn't been populated.
+//
+// Atomic access to a uint64 field needs it to be 64-bit aligned, which the
+// struct layout only guarantees on 64-bit platforms.
+func (tx *DomainTransaction) LoadMass() uint64 {
+	return atomic.LoadUint64(&tx.Mass)
+}
+
+// StoreMass sets the transaction mass; 0 marks it as not populated.
+func (tx *DomainTransaction) StoreMass(mass uint64) {
+	atomic.StoreUint64(&tx.Mass, mass)
+}
+
+// LoadFee returns the transaction fee, or 0 if it hasn't been populated.
+//
+// Atomic access to a uint64 field needs it to be 64-bit aligned, which the
+// struct layout only guarantees on 64-bit platforms.
+func (tx *DomainTransaction) LoadFee() uint64 {
+	return atomic.LoadUint64(&tx.Fee)
+}
+
+// StoreFee sets the transaction fee.
+func (tx *DomainTransaction) StoreFee(fee uint64) {
+	atomic.StoreUint64(&tx.Fee, fee)
+}
+
+// Clone returns a clone of DomainTransaction
+func (tx *DomainTransaction) Clone() *DomainTransaction {
+	inputsClone := make([]*DomainTransactionInput, len(tx.Inputs))
+	for i, input := range tx.Inputs {
+		inputsClone[i] = input.Clone()
+	}
+
+	outputsClone := make([]*DomainTransactionOutput, len(tx.Outputs))
+	for i, output := range tx.Outputs {
+		outputsClone[i] = output.Clone()
+	}
+
+	var payloadClone []byte
+	if len(tx.Payload) > 0 {
+		payloadClone = bytes.Clone(tx.Payload)
+	}
+
+	var idClone *DomainTransactionID
+	if id := tx.CachedID(); id != nil {
+		idClone = id.Clone()
+	}
+
+	return &DomainTransaction{
+		Version:      tx.Version,
+		Inputs:       inputsClone,
+		Outputs:      outputsClone,
+		LockTime:     tx.LockTime,
+		SubnetworkID: *tx.SubnetworkID.Clone(),
+		Gas:          tx.Gas,
+		Payload:      payloadClone,
+		Fee:          tx.LoadFee(),
+		Mass:         tx.LoadMass(),
+		ID:           idClone,
+	}
+}
+
+// If this doesn't compile, it means the type definition has been changed, so it's
+// an indication to update Equal and Clone accordingly.
+var _ = DomainTransaction{
+	0,
+	[]*DomainTransactionInput{},
+	[]*DomainTransactionOutput{},
+	0,
+	DomainSubnetworkID{},
+	0,
+	[]byte{},
+	0, 0,
+	&DomainTransactionID{},
+}
+
+// Equal returns whether tx equals to other
+func (tx *DomainTransaction) Equal(other *DomainTransaction) bool {
+	if tx == nil || other == nil {
+		return tx == other
+	}
+
+	if tx.Version != other.Version {
+		return false
+	}
+
+	if len(tx.Inputs) != len(other.Inputs) {
+		return false
+	}
+
+	for i, input := range tx.Inputs {
+		if !input.Equal(other.Inputs[i]) {
+			return false
+		}
+	}
+
+	if len(tx.Outputs) != len(other.Outputs) {
+		return false
+	}
+
+	for i, output := range tx.Outputs {
+		if !output.Equal(other.Outputs[i]) {
+			return false
+		}
+	}
+
+	if tx.LockTime != other.LockTime {
+		return false
+	}
+
+	if !tx.SubnetworkID.Equal(&other.SubnetworkID) {
+		return false
+	}
+
+	if tx.Gas != other.Gas {
+		return false
+	}
+
+	if !bytes.Equal(tx.Payload, other.Payload) {
+		return false
+	}
+
+	if fee, otherFee := tx.LoadFee(), other.LoadFee(); fee != 0 && otherFee != 0 && fee != otherFee {
+		panic(errors.New("identical transactions should always have the same fee"))
+	}
+
+	if mass, otherMass := tx.LoadMass(), other.LoadMass(); mass != 0 && otherMass != 0 && mass != otherMass {
+		panic(errors.New("identical transactions should always have the same mass"))
+	}
+
+	if id, otherID := tx.CachedID(), other.CachedID(); id != nil && otherID != nil && !id.Equal(otherID) {
+		panic(errors.New("identical transactions should always have the same ID"))
+	}
+
+	return true
+}
+
+// DomainTransactionInput represents a Hoosat transaction input
+type DomainTransactionInput struct {
+	PreviousOutpoint DomainOutpoint
+	SignatureScript  []byte
+	Sequence         uint64
+	SigOpCount       byte
+
+	UTXOEntry UTXOEntry
+}
+
+// If this doesn't compile, it means the type definition has been changed, so it's
+// an indication to update Equal and Clone accordingly.
+var _ = &DomainTransactionInput{DomainOutpoint{}, []byte{}, 0, 0, nil}
+
+// Equal returns whether input equals to other
+func (input *DomainTransactionInput) Equal(other *DomainTransactionInput) bool {
+	if input == nil || other == nil {
+		return input == other
+	}
+
+	if !input.PreviousOutpoint.Equal(&other.PreviousOutpoint) {
+		return false
+	}
+
+	if !bytes.Equal(input.SignatureScript, other.SignatureScript) {
+		return false
+	}
+
+	if input.Sequence != other.Sequence {
+		return false
+	}
+
+	if input.SigOpCount != other.SigOpCount {
+		return false
+	}
+
+	if input.UTXOEntry != nil && other.UTXOEntry != nil && !input.UTXOEntry.Equal(other.UTXOEntry) {
+		panic(errors.New("identical inputs should always have the same UTXO entry"))
+	}
+
+	return true
+}
+
+// Clone returns a clone of DomainTransactionInput
+func (input *DomainTransactionInput) Clone() *DomainTransactionInput {
+	return &DomainTransactionInput{
+		PreviousOutpoint: *input.PreviousOutpoint.Clone(),
+		SignatureScript:  slices.Clone(input.SignatureScript),
+		Sequence:         input.Sequence,
+		SigOpCount:       input.SigOpCount,
+		UTXOEntry:        input.UTXOEntry,
+	}
+}
+
+// DomainOutpoint represents a Hoosat transaction outpoint
+type DomainOutpoint struct {
+	TransactionID DomainTransactionID
+	Index         uint32
+}
+
+// If this doesn't compile, it means the type definition has been changed, so it's
+// an indication to update Equal and Clone accordingly.
+var _ = DomainOutpoint{DomainTransactionID{}, 0}
+
+// Equal returns whether op equals to other
+func (op *DomainOutpoint) Equal(other *DomainOutpoint) bool {
+	if op == nil || other == nil {
+		return op == other
+	}
+
+	return *op == *other
+}
+
+// Clone returns a clone of DomainOutpoint
+func (op *DomainOutpoint) Clone() *DomainOutpoint {
+	return &DomainOutpoint{
+		TransactionID: *op.TransactionID.Clone(),
+		Index:         op.Index,
+	}
+}
+
+// String stringifies an outpoint.
+func (op DomainOutpoint) String() string {
+	return fmt.Sprintf("(%s: %d)", op.TransactionID, op.Index)
+}
+
+// NewDomainOutpoint instantiates a new DomainOutpoint with the given id and index
+func NewDomainOutpoint(id *DomainTransactionID, index uint32) *DomainOutpoint {
+	return &DomainOutpoint{
+		TransactionID: *id,
+		Index:         index,
+	}
+}
+
+// ScriptPublicKey represents a Hoosatd ScriptPublicKey
+type ScriptPublicKey struct {
+	Script  []byte
+	Version uint16
+}
+
+// Equal returns whether spk equals to other
+func (spk *ScriptPublicKey) Equal(other *ScriptPublicKey) bool {
+	if spk == nil || other == nil {
+		return spk == other
+	}
+
+	if spk.Version != other.Version {
+		return false
+	}
+
+	return bytes.Equal(spk.Script, other.Script)
+}
+
+// String stringifies a ScriptPublicKey.
+func (spk *ScriptPublicKey) String() string {
+	needed := 2 + len(spk.Script)
+	b := *scriptPublicKeyStringPool.Get().(*[]byte)
+	if cap(b) < needed {
+		b = make([]byte, needed)
+	} else {
+		b = b[:needed]
+	}
+	binary.LittleEndian.PutUint16(b, spk.Version)
+	copy(b[2:], spk.Script)
+	s := string(b)
+	b = b[:0]
+	scriptPublicKeyStringPool.Put(&b)
+	return s
+}
+
+// NewScriptPublicKeyFromString converts the given string to a scriptPublicKey
+func NewScriptPublicKeyFromString(scriptPublicKeyString string) *ScriptPublicKey {
+	bytes := []byte(scriptPublicKeyString)
+	version := binary.LittleEndian.Uint16(bytes[:2])
+	script := bytes[2:]
+	return &ScriptPublicKey{Script: script, Version: version}
+}
+
+// DomainTransactionOutput represents a Hoosatd transaction output
+type DomainTransactionOutput struct {
+	Value           uint64
+	ScriptPublicKey *ScriptPublicKey
+}
+
+// If this doesn't compile, it means the type definition has been changed, so it's
+// an indication to update Equal and Clone accordingly.
+var _ = DomainTransactionOutput{0, &ScriptPublicKey{Script: []byte{}, Version: 0}}
+
+// Equal returns whether output equals to other
+func (output *DomainTransactionOutput) Equal(other *DomainTransactionOutput) bool {
+	if output == nil || other == nil {
+		return output == other
+	}
+
+	if output.Value != other.Value {
+		return false
+	}
+
+	return output.ScriptPublicKey.Equal(other.ScriptPublicKey)
+}
+
+// Clone returns a clone of DomainTransactionOutput
+func (output *DomainTransactionOutput) Clone() *DomainTransactionOutput {
+	return &DomainTransactionOutput{
+		Value: output.Value,
+		ScriptPublicKey: &ScriptPublicKey{
+			Script:  slices.Clone(output.ScriptPublicKey.Script),
+			Version: output.ScriptPublicKey.Version,
+		},
+	}
+}
+
+// DomainTransactionID represents the ID of a Hoosat transaction
+type DomainTransactionID DomainHash
+
+// NewDomainTransactionIDFromByteArray constructs a new TransactionID out of a byte array
+func NewDomainTransactionIDFromByteArray(transactionIDBytes *[DomainHashSize]byte) *DomainTransactionID {
+	return (*DomainTransactionID)(NewDomainHashFromByteArray(transactionIDBytes))
+}
+
+// NewDomainTransactionIDFromByteSlice constructs a new TransactionID out of a byte slice
+// Returns an error if the length of the byte slice is not exactly `DomainHashSize`
+func NewDomainTransactionIDFromByteSlice(transactionIDBytes []byte) (*DomainTransactionID, error) {
+	hash, err := NewDomainHashFromByteSlice(transactionIDBytes)
+	if err != nil {
+		return nil, err
+	}
+	return (*DomainTransactionID)(hash), nil
+}
+
+// NewDomainTransactionIDFromString constructs a new TransactionID out of a string
+// Returns an error if the length of the string is not exactly `DomainHashSize * 2`
+func NewDomainTransactionIDFromString(transactionIDString string) (*DomainTransactionID, error) {
+	hash, err := NewDomainHashFromString(transactionIDString)
+	if err != nil {
+		return nil, err
+	}
+	return (*DomainTransactionID)(hash), nil
+}
+
+// String stringifies a transaction ID.
+func (id DomainTransactionID) String() string {
+	return DomainHash(id).String()
+}
+
+// Clone returns a clone of DomainTransactionID
+func (id *DomainTransactionID) Clone() *DomainTransactionID {
+	idClone := *id
+	return &idClone
+}
+
+// Equal returns whether id equals to other
+func (id *DomainTransactionID) Equal(other *DomainTransactionID) bool {
+	return (*DomainHash)(id).Equal((*DomainHash)(other))
+}
+
+// Less returns true if id is less than other
+func (id *DomainTransactionID) Less(other *DomainTransactionID) bool {
+	return (*DomainHash)(id).Less((*DomainHash)(other))
+}
+
+// LessOrEqual returns true if id is smaller or equal to other
+func (id *DomainTransactionID) LessOrEqual(other *DomainTransactionID) bool {
+	return (*DomainHash)(id).LessOrEqual((*DomainHash)(other))
+}
+
+// ByteArray returns the bytes in this transactionID represented as a byte array.
+// The transactionID bytes are cloned, therefore it is safe to modify the resulting array.
+func (id *DomainTransactionID) ByteArray() *[DomainHashSize]byte {
+	return (*DomainHash)(id).ByteArray()
+}
+
+// ByteSlice returns the bytes in this transactionID represented as a byte slice.
+// The transactionID bytes are cloned, therefore it is safe to modify the resulting slice.
+func (id *DomainTransactionID) ByteSlice() []byte {
+	return (*DomainHash)(id).ByteSlice()
+}

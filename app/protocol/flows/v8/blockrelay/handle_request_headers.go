@@ -1,0 +1,187 @@
+package blockrelay
+
+import (
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/peer"
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/protocolerrors"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	"github.com/HoosatNetwork/HTND/v2/domain"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/router"
+)
+
+// This constant must be equal at both syncer and syncee. Therefore, never (!!) change this constant unless a new p2p
+// version is introduced. See `TestIBDBatchSizeLessThanRouteCapacity` as well.
+func getIBDBatchSize() int {
+	return 99 * 5
+}
+
+// RequestHeadersContext is the interface for the context needed for the HandleRequestHeaders flow.
+type RequestHeadersContext interface {
+	Domain() domain.Domain
+}
+
+type handleRequestHeadersFlow struct {
+	RequestHeadersContext
+	incomingRoute, outgoingRoute *router.Route
+	peer                         *peer.Peer
+
+	// lastServed* cache the most recently answered (lowHash, highHash) chunk of this flow, so a peer
+	// that keeps resending an identical request without ever progressing - observed happening every
+	// few seconds for hours straight from one peer, each time paying the cost of GetHashesBetween and
+	// GetBlockHeaders (both of which take the shared consensus lock this node's own block template
+	// building and block submission also need) - is answered from cache instead of recomputing.
+	// Headers for an already-committed (lowHash, highHash) range are immutable once served, so caching
+	// exactly one most-recent entry is both safe and enough: any peer actually making progress sends a
+	// different request every time and never hits it.
+	lastServedLowHash, lastServedHighHash, lastServedActualHighHash *externalapi.DomainHash
+	lastServedHeadersMessage                                        *appmessage.BlockHeadersMessage
+}
+
+// HandleRequestHeaders handles RequestHeaders messages
+func HandleRequestHeaders(context RequestHeadersContext, incomingRoute *router.Route,
+	outgoingRoute *router.Route, peer *peer.Peer,
+) error {
+	flow := &handleRequestHeadersFlow{
+		RequestHeadersContext: context,
+		incomingRoute:         incomingRoute,
+		outgoingRoute:         outgoingRoute,
+		peer:                  peer,
+	}
+	return flow.start()
+}
+
+func (flow *handleRequestHeadersFlow) start() error {
+	for {
+		lowHash, highHash, err := receiveRequestHeaders(flow.incomingRoute)
+		if err != nil {
+			return err
+		}
+		log.Debugf("Received requestHeaders with lowHash: %s, highHash: %s", lowHash, highHash)
+
+		consensus := flow.Domain().Consensus()
+
+		lowHashInfo, err := consensus.GetBlockInfo(lowHash)
+		if err != nil {
+			return err
+		}
+		if !lowHashInfo.HasHeader() {
+			return protocolerrors.Errorf(true, "Block %s does not exist", lowHash)
+		}
+
+		// lowHash, err = consensus.ValidateLowHashIsFunctionalPruningPoint(lowHash)
+		// if err != nil {
+		// 	return err
+		// }
+
+		highHashInfo, err := consensus.GetBlockInfo(highHash)
+		if err != nil {
+			return err
+		}
+		if !highHashInfo.HasHeader() {
+			return protocolerrors.Errorf(true, "Block %s does not exist", highHash)
+		}
+
+		isLowSelectedAncestorOfHigh, err := consensus.IsInSelectedParentChainOf(lowHash, highHash)
+		if err != nil {
+			return err
+		}
+		if !isLowSelectedAncestorOfHigh {
+			return protocolerrors.Errorf(true, "Expected %s to be on the selected chain of %s",
+				lowHash, highHash)
+		}
+
+		for !lowHash.Equal(highHash) {
+			log.Debugf("Getting block headers between %s and %s to %s", lowHash, highHash, flow.peer)
+
+			var blockHeadersMessage *appmessage.BlockHeadersMessage
+			var actualHighHash *externalapi.DomainHash
+			if flow.lastServedLowHash != nil && flow.lastServedLowHash.Equal(lowHash) && flow.lastServedHighHash.Equal(highHash) {
+				// This exact chunk was just served to this same peer - most likely it never advanced
+				// past this point and resent the identical request instead of a RequestNextHeaders.
+				// Re-send the cached response rather than paying for GetHashesBetween/GetBlockHeaders
+				// again; both take the same consensus lock this node's own block template building and
+				// block submission need, and a peer stuck like this can otherwise repeat every few
+				// seconds indefinitely.
+				log.Debugf("Peer %s repeated the identical headers request (lowHash: %s, highHash: %s) - "+
+					"serving the cached response instead of recomputing it", flow.peer, lowHash, highHash)
+				blockHeadersMessage = flow.lastServedHeadersMessage
+				actualHighHash = flow.lastServedActualHighHash
+			} else {
+				// GetHashesBetween is a relatively heavy operation so we limit it
+				// in order to avoid locking the consensus for too long
+				// maxBlocks MUST be >= MergeSetSizeLimit + 1
+				const maxBlocks = 1 << 12
+				var blockHashes []*externalapi.DomainHash
+				var err error
+				blockHashes, actualHighHash, err = consensus.GetHashesBetween(lowHash, highHash, maxBlocks, false)
+				if err != nil {
+					return err
+				}
+				log.Debugf("lowhash %s, highhash %s", lowHash, highHash)
+				log.Debugf("Got %d header hashes above lowHash %s", len(blockHashes), lowHash)
+
+				// Fetch headers in a single batch to reduce consensus read overhead
+				domainHeaders, err := consensus.GetBlockHeaders(blockHashes)
+				if err != nil {
+					return err
+				}
+				// if len(blockHashes) != len(domainHeaders) {
+				// 	log.Infof("Length of block hashes %d and domain headers %d is different", len(blockHashes), len(domainHeaders))
+				// }
+				blockHeaders := make([]*appmessage.MsgBlockHeader, len(domainHeaders))
+				for i, dh := range domainHeaders {
+					blockHeaders[i] = appmessage.DomainBlockHeaderToBlockHeader(dh)
+				}
+
+				log.Infof("Relaying %d headers through IBD to peer %s", len(blockHeaders), flow.peer.Address())
+				blockHeadersMessage = appmessage.NewBlockHeadersMessage(blockHeaders)
+
+				flow.lastServedLowHash = lowHash
+				flow.lastServedHighHash = highHash
+				flow.lastServedActualHighHash = actualHighHash
+				flow.lastServedHeadersMessage = blockHeadersMessage
+			}
+			err = flow.outgoingRoute.Enqueue(blockHeadersMessage)
+			if err != nil {
+				return err
+			}
+
+			message, err := flow.incomingRoute.Dequeue()
+			if err != nil {
+				return err
+			}
+			if _, ok := message.(*appmessage.MsgRequestNextHeaders); !ok {
+				return protocolerrors.Errorf(true, "received unexpected message type. "+
+					"expected: %s, got: %s", appmessage.CmdRequestNextHeaders, message.Command())
+			}
+
+			// The next lowHash is the last element in blockHashes
+			lowHash = actualHighHash
+			log.Debugf("New lowhash %s", lowHash)
+		}
+		log.Debugf("Sending IBD done")
+		err = flow.outgoingRoute.Enqueue(appmessage.NewMsgDoneHeaders())
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func receiveRequestHeaders(incomingRoute *router.Route) (lowHash *externalapi.DomainHash,
+	highHash *externalapi.DomainHash, err error,
+) {
+	message, err := incomingRoute.Dequeue()
+	if err != nil {
+		return nil, nil, err
+	}
+	// This route also carries RequestNextHeaders, which is only valid inside a header exchange. An
+	// unchecked assertion here panicked on one sent out of turn, and the panic took the node down.
+	msgRequestIBDBlocks, ok := message.(*appmessage.MsgRequestHeaders)
+	if !ok {
+		return nil, nil, protocolerrors.Errorf(true, "received unexpected message type. "+
+			"expected: %s, got: %s", appmessage.CmdRequestHeaders, message.Command())
+	}
+
+	return msgRequestIBDBlocks.LowHash, msgRequestIBDBlocks.HighHash, nil
+}

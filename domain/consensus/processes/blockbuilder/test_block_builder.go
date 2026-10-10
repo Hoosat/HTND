@@ -1,0 +1,344 @@
+package blockbuilder
+
+import (
+	"encoding/binary"
+	"math/big"
+	"sort"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/database"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/testapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/blockheader"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/constants"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/transactionhelper"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/txscript"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/logger"
+	"github.com/pkg/errors"
+)
+
+type testBlockBuilder struct {
+	*blockBuilder
+	testConsensus                  testapi.TestConsensus
+	nonceCounter                   uint64
+	timeCounter                    int64
+	uniqueDefaultCoinbaseExtraData bool
+}
+
+// NewTestBlockBuilder creates an instance of a TestBlockBuilder
+func NewTestBlockBuilder(baseBlockBuilder model.BlockBuilder, testConsensus testapi.TestConsensus) testapi.TestBlockBuilder {
+	return &testBlockBuilder{
+		blockBuilder:  baseBlockBuilder.(*blockBuilder),
+		testConsensus: testConsensus,
+	}
+}
+
+// EnableUniqueDefaultCoinbaseExtraData makes every subsequently built block that's
+// given a nil coinbaseData get distinct coinbase ExtraData instead of the shared
+// empty default. See the TestBlockBuilder interface doc for why this matters.
+func (bb *testBlockBuilder) EnableUniqueDefaultCoinbaseExtraData() {
+	bb.uniqueDefaultCoinbaseExtraData = true
+}
+
+func cleanBlockPrefilledFields(block *externalapi.DomainBlock) {
+	for _, tx := range block.Transactions {
+		tx.StoreFee(0)
+		tx.StoreMass(0)
+		tx.SetCachedID(nil)
+
+		for _, input := range tx.Inputs {
+			input.UTXOEntry = nil
+		}
+	}
+}
+
+func (bb *testBlockBuilder) nextTempBlockHash() *externalapi.DomainHash {
+	bb.timeCounter++
+	if bb.timeCounter < 0 {
+		panic("timeCounter cannot be negative")
+	}
+	byteArray := [externalapi.DomainHashSize]byte{}
+	binary.LittleEndian.PutUint64(byteArray[:8], uint64(bb.timeCounter))
+	return externalapi.NewDomainHashFromByteArray(&byteArray)
+}
+
+// BuildBlockWithParents builds a block with provided parents, coinbaseData and transactions,
+// and returns the block together with its past UTXO-diff from the virtual.
+func (bb *testBlockBuilder) BuildBlockWithParents(parentHashes []*externalapi.DomainHash,
+	coinbaseData *externalapi.DomainCoinbaseData, transactions []*externalapi.DomainTransaction) (
+	*externalapi.DomainBlock, externalapi.UTXODiff, error,
+) {
+	onEnd := logger.LogAndMeasureExecutionTime(log, "BuildBlockWithParents")
+	defer onEnd()
+
+	stagingArea := model.NewStagingArea()
+
+	block, diff, err := bb.buildBlockWithParents(stagingArea, parentHashes, coinbaseData, transactions)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// It's invalid to insert a block with prefilled fields to consensus, so we
+	// clean them before returning the block.
+	cleanBlockPrefilledFields(block)
+
+	return block, diff, nil
+}
+
+func (bb *testBlockBuilder) buildUTXOInvalidHeader(stagingArea *model.StagingArea,
+	tempHash *externalapi.DomainHash, parentHashes []*externalapi.DomainHash, bits uint32, daaScore, blueScore uint64, blueWork *big.Int,
+	transactions []*externalapi.DomainTransaction,
+) (externalapi.BlockHeader, error) {
+	timeInMilliseconds, err := bb.minBlockTime(stagingArea, tempHash)
+	if err != nil {
+		return nil, err
+	}
+
+	hashMerkleRoot := bb.newBlockHashMerkleRoot(transactions)
+
+	pruningPoint, err := bb.newBlockPruningPoint(stagingArea, tempHash)
+	if err != nil {
+		return nil, err
+	}
+
+	newBlockParents := false
+	if bb.blockVersionForDAAScore(daaScore) >= 7 {
+		newBlockParents = true
+	}
+	parents, err := bb.blockParentBuilder.BuildParents(stagingArea, daaScore, parentHashes, newBlockParents)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, blockLevelParents := range parents {
+		sort.Slice(blockLevelParents, func(i, j int) bool {
+			return blockLevelParents[i].Less(blockLevelParents[j])
+		})
+	}
+
+	// Raise BlockVersion until daaScore is more than powScore
+	var version uint16 = 1
+	for _, powScore := range bb.powScores {
+		if daaScore >= powScore {
+			version++
+		}
+	}
+	bb.nonceCounter++
+	return blockheader.NewImmutableBlockHeader(
+		version,
+		parents,
+		hashMerkleRoot,
+		&externalapi.DomainHash{},
+		&externalapi.DomainHash{},
+		timeInMilliseconds,
+		bits,
+		bb.nonceCounter,
+		daaScore,
+		blueScore,
+		blueWork,
+		pruningPoint,
+	), nil
+}
+
+func (bb *testBlockBuilder) buildHeaderWithParents(stagingArea *model.StagingArea,
+	tempHash *externalapi.DomainHash, parentHashes []*externalapi.DomainHash, bits uint32, transactions []*externalapi.DomainTransaction,
+	acceptanceData externalapi.AcceptanceData, multiset model.Multiset, daaScore, blueScore uint64, blueWork *big.Int,
+) (externalapi.BlockHeader, error) {
+	header, err := bb.buildUTXOInvalidHeader(stagingArea, tempHash, parentHashes, bits, daaScore, blueScore, blueWork, transactions)
+	if err != nil {
+		return nil, err
+	}
+
+	hashMerkleRoot := bb.newBlockHashMerkleRoot(transactions)
+	acceptedIDMerkleRoot, err := bb.calculateAcceptedIDMerkleRoot(acceptanceData, header.Version())
+	if err != nil {
+		return nil, err
+	}
+	utxoCommitment := multiset.Hash()
+
+	return blockheader.NewImmutableBlockHeader(
+		header.Version(),
+		header.Parents(),
+		hashMerkleRoot,
+		acceptedIDMerkleRoot,
+		utxoCommitment,
+		header.TimeInMilliseconds(),
+		header.Bits(),
+		header.Nonce(),
+		header.DAAScore(),
+		header.BlueScore(),
+		header.BlueWork(),
+		header.PruningPoint(),
+	), nil
+}
+
+func (bb *testBlockBuilder) buildBlockWithParents(stagingArea *model.StagingArea, parentHashes []*externalapi.DomainHash,
+	coinbaseData *externalapi.DomainCoinbaseData, transactions []*externalapi.DomainTransaction) (
+	*externalapi.DomainBlock, externalapi.UTXODiff, error,
+) {
+	tempHash := bb.nextTempBlockHash()
+
+	if coinbaseData == nil {
+		scriptPublicKeyScript, err := txscript.PayToScriptHashScript([]byte{txscript.OpTrue})
+		if err != nil {
+			panic(errors.Wrapf(err, "Couldn't parse opTrueScript. This should never happen"))
+		}
+		scriptPublicKey := &externalapi.ScriptPublicKey{Script: scriptPublicKeyScript, Version: constants.MaxScriptPublicKeyVersion}
+		extraData := []byte{}
+		if bb.uniqueDefaultCoinbaseExtraData {
+			// See EnableUniqueDefaultCoinbaseExtraData: distinguish otherwise-identical
+			// siblings/parallel chains (same blue score, same default script, same empty
+			// extra data) so their coinbase transaction IDs don't collide.
+			extraData = tempHash.ByteSlice()[:8]
+		}
+		coinbaseData = &externalapi.DomainCoinbaseData{
+			ScriptPublicKey: scriptPublicKey,
+			ExtraData:       extraData,
+		}
+	}
+
+	bb.blockRelationStore.StageBlockRelation(stagingArea, tempHash, &model.BlockRelations{Parents: parentHashes})
+
+	err := bb.ghostdagManager.GHOSTDAG(stagingArea, tempHash)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bits, err := bb.difficultyManager.StageDAADataAndReturnRequiredDifficulty(stagingArea, tempHash, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	daaScore, err := bb.daaBlocksStore.DAAScore(bb.databaseContext, stagingArea, tempHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	constants.SetBlockVersion(bb.blockVersionForDAAScore(daaScore))
+
+	ghostdagData, err := bb.ghostdagDataStore.Get(bb.databaseContext, stagingArea, tempHash, false)
+	if database.IsNotFoundError(err) {
+		log.Infof("buildBlockWithParents failed to retrieve with %s\n", tempHash)
+		return nil, nil, err
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	blueWork := ghostdagData.BlueWork()
+	blueScore := ghostdagData.BlueScore()
+
+	selectedParentStatus, err := bb.testConsensus.ConsensusStateManager().ResolveBlockStatusTest(
+		stagingArea, ghostdagData.SelectedParent(), false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if selectedParentStatus == externalapi.StatusDisqualifiedFromChain {
+		return nil, nil, errors.Errorf("Error building block with selectedParent %s with status DisqualifiedFromChain",
+			ghostdagData.SelectedParent())
+	}
+
+	pastUTXO, acceptanceData, multiset, err := bb.consensusStateManager.CalculatePastUTXOAndAcceptanceData(stagingArea, tempHash)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	bb.acceptanceDataStore.Stage(stagingArea, tempHash, acceptanceData)
+
+	// tempHash has no stored header yet, so ExpectedCoinbaseTransaction needs the candidate timestamp
+	// buildUTXOInvalidHeader (called below via buildHeaderWithParents) will independently compute for
+	// this same tempHash - minBlockTime is pure given the same stagingArea/hash, so both calls land
+	// on the identical value without needing to be threaded together explicitly.
+	candidateTimestamp, err := bb.minBlockTime(stagingArea, tempHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	coinbase, _, err := bb.coinbaseManager.ExpectedCoinbaseTransaction(stagingArea, tempHash, coinbaseData, candidateTimestamp)
+	if err != nil {
+		return nil, nil, err
+	}
+	transactionsWithCoinbase := append([]*externalapi.DomainTransaction{coinbase}, transactions...)
+
+	err = bb.testConsensus.ReachabilityManager().AddBlock(stagingArea, tempHash)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	header, err := bb.buildHeaderWithParents(
+		stagingArea, tempHash, parentHashes, bits, transactionsWithCoinbase, acceptanceData, multiset, daaScore, blueScore, blueWork)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &externalapi.DomainBlock{
+		Header:       header,
+		Transactions: transactionsWithCoinbase,
+	}, pastUTXO, nil
+}
+
+func (bb *testBlockBuilder) BuildUTXOInvalidHeader(parentHashes []*externalapi.DomainHash) (externalapi.BlockHeader,
+	error,
+) {
+	block, err := bb.BuildUTXOInvalidBlock(parentHashes)
+	if err != nil {
+		return nil, err
+	}
+
+	return block.Header, nil
+}
+
+func (bb *testBlockBuilder) BuildUTXOInvalidBlock(parentHashes []*externalapi.DomainHash) (*externalapi.DomainBlock,
+	error,
+) {
+	stagingArea := model.NewStagingArea()
+	tempHash := bb.nextTempBlockHash()
+
+	bb.blockRelationStore.StageBlockRelation(stagingArea, tempHash, &model.BlockRelations{Parents: parentHashes})
+
+	err := bb.ghostdagManager.GHOSTDAG(stagingArea, tempHash)
+	if err != nil {
+		return nil, err
+	}
+
+	bits, err := bb.difficultyManager.StageDAADataAndReturnRequiredDifficulty(stagingArea, tempHash, false)
+	if err != nil {
+		return nil, err
+	}
+	daaScore, err := bb.daaBlocksStore.DAAScore(bb.databaseContext, stagingArea, tempHash)
+	if err != nil {
+		return nil, err
+	}
+
+	ghostdagData, err := bb.ghostdagDataStore.Get(bb.databaseContext, stagingArea, tempHash, false)
+	if database.IsNotFoundError(err) {
+		log.Infof("BuildUTXOInvalidBlock failed to retrieve with %s\n", tempHash)
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+	blueWork := ghostdagData.BlueWork()
+	blueScore := ghostdagData.BlueScore()
+
+	// We use the genesis coinbase so that we'll have something to build merkle root and a new coinbase with
+	genesisTransactions := bb.testConsensus.DAGParams().GenesisBlock.Transactions
+	genesisCoinbase := genesisTransactions[transactionhelper.CoinbaseTransactionIndex].Clone()
+	binary.LittleEndian.PutUint64(genesisCoinbase.Payload[:8], ghostdagData.BlueScore())
+	transactions := []*externalapi.DomainTransaction{genesisCoinbase}
+
+	err = bb.testConsensus.ReachabilityManager().AddBlock(stagingArea, tempHash)
+	if err != nil {
+		return nil, err
+	}
+
+	header, err := bb.buildUTXOInvalidHeader(stagingArea, tempHash, parentHashes, bits, daaScore, blueScore, blueWork, transactions)
+	if err != nil {
+		return nil, err
+	}
+
+	return &externalapi.DomainBlock{
+		Header:       header,
+		Transactions: transactions,
+	}, nil
+}
+
+func (bb *testBlockBuilder) SetNonceCounter(nonceCounter uint64) {
+	bb.nonceCounter = nonceCounter
+}

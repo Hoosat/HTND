@@ -1,0 +1,120 @@
+package ghostdagdatastore
+
+import (
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/database"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/database/serialization"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/lrucacheghostdagdata"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/logger"
+	"github.com/HoosatNetwork/HTND/v2/util/staging"
+	"github.com/cockroachdb/errors"
+)
+
+var (
+	log                    = logger.RegisterSubSystem("GDS")
+	ghostdagDataBucketName = []byte("block-ghostdag-data")
+	trustedDataBucketName  = []byte("block-with-trusted-data-ghostdag-data")
+)
+
+// ghostdagDataStore represents a store of BlockGHOSTDAGData
+type ghostdagDataStore struct {
+	shardID            model.StagingShardID
+	cache              *lrucacheghostdagdata.LRUCache
+	ghostdagDataBucket model.DBBucket
+	trustedDataBucket  model.DBBucket
+}
+
+// New instantiates a new GHOSTDAGDataStore
+func New(prefixBucket model.DBBucket, cacheSize int, preallocate bool) model.GHOSTDAGDataStore {
+	return &ghostdagDataStore{
+		shardID:            staging.GenerateShardingID(),
+		cache:              lrucacheghostdagdata.New(cacheSize, preallocate),
+		ghostdagDataBucket: prefixBucket.Bucket(ghostdagDataBucketName),
+		trustedDataBucket:  prefixBucket.Bucket(trustedDataBucketName),
+	}
+}
+
+// Stage stages the given blockGHOSTDAGData for the given blockHash
+func (gds *ghostdagDataStore) Stage(stagingArea *model.StagingArea, blockHash *externalapi.DomainHash,
+	blockGHOSTDAGData *externalapi.BlockGHOSTDAGData, isTrustedData bool,
+) {
+	if blockHash == nil {
+		log.Critical("Attempted to stage with nil blockHash")
+		return
+	}
+	stagingShard := gds.stagingShard(stagingArea)
+
+	stagingShard.toAdd[newKey(blockHash, isTrustedData)] = blockGHOSTDAGData
+}
+
+func (gds *ghostdagDataStore) IsStaged(stagingArea *model.StagingArea) bool {
+	return gds.stagingShard(stagingArea).isStaged()
+}
+
+// Get gets the blockGHOSTDAGData associated with the given blockHash
+func (gds *ghostdagDataStore) Get(dbContext model.DBReader, stagingArea *model.StagingArea, blockHash *externalapi.DomainHash, isTrustedData bool) (*externalapi.BlockGHOSTDAGData, error) {
+	if blockHash == nil {
+		return nil, errors.New("blockHash is nil")
+	}
+	stagingShard := gds.stagingShard(stagingArea)
+
+	key := newKey(blockHash, isTrustedData)
+	blockGHOSTDAGData, ok := stagingShard.toAdd[key]
+	if ok && blockGHOSTDAGData != nil {
+		return blockGHOSTDAGData, nil
+	}
+
+	blockGHOSTDAGDataCached, ok := gds.cache.Get(blockHash, isTrustedData)
+	if ok && blockGHOSTDAGDataCached != nil {
+		return blockGHOSTDAGDataCached, nil
+	}
+
+	blockGHOSTDAGDataBytes, err := dbContext.Get(gds.serializeKey(key))
+	if errors.Is(err, database.ErrNotFound) {
+		if blockHash.Equal(model.VirtualGenesisBlockHash) {
+			panic(errors.Wrapf(err, "Block %s GhostDAG data does not exist in db", blockHash))
+		}
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	blockGHOSTDAGDataDeserialized, err := gds.deserializeBlockGHOSTDAGData(blockGHOSTDAGDataBytes)
+	if err != nil {
+		return nil, err
+	}
+	gds.cache.Add(blockHash, isTrustedData, blockGHOSTDAGDataDeserialized)
+	return blockGHOSTDAGDataDeserialized, nil
+}
+
+func (gds *ghostdagDataStore) UnstageAll(stagingArea *model.StagingArea) {
+	stagingShard := gds.stagingShard(stagingArea)
+	stagingShard.toAdd = make(map[key]*externalapi.BlockGHOSTDAGData)
+}
+
+func (gds *ghostdagDataStore) serializeKey(k key) model.DBKey {
+	if k.isTrustedData {
+		return gds.trustedDataBucket.Key(k.hash.ByteSlice())
+	}
+	return gds.ghostdagDataBucket.Key(k.hash.ByteSlice())
+}
+
+func (gds *ghostdagDataStore) serializeBlockGHOSTDAGData(blockGHOSTDAGData *externalapi.BlockGHOSTDAGData) ([]byte, error) {
+	return serialization.BlockGHOSTDAGDataToDBBlockGHOSTDAGData(blockGHOSTDAGData).MarshalVT()
+}
+
+func (gds *ghostdagDataStore) deserializeBlockGHOSTDAGData(blockGHOSTDAGDataBytes []byte) (*externalapi.BlockGHOSTDAGData, error) {
+	dbBlockGHOSTDAGData := &serialization.DbBlockGhostdagData{}
+	err := dbBlockGHOSTDAGData.UnmarshalVT(blockGHOSTDAGDataBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return serialization.DBBlockGHOSTDAGDataToBlockGHOSTDAGData(dbBlockGHOSTDAGData)
+}
+
+func (gds *ghostdagDataStore) CacheLen() int {
+	return gds.cache.Len()
+}

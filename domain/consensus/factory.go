@@ -1,0 +1,929 @@
+package consensus
+
+import (
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/blockwindowheapslicestore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/daawindowstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/mergedepthrootstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/blockparentbuilder"
+	parentssanager "github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/parentsmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/pruningproofmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/constants"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/pow"
+	"github.com/HoosatNetwork/HTND/v2/util/staging"
+	"github.com/pkg/errors"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/prefixmanager/prefix"
+	"github.com/HoosatNetwork/HTND/v2/util/txmass"
+
+	consensusdatabase "github.com/HoosatNetwork/HTND/v2/domain/consensus/database"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/acceptancedatastore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/blockheaderstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/blockrelationstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/blockstatusstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/blockstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/consensusstatestore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/daablocksstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/finalitystore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/ghostdagdatastore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/headersselectedchainstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/headersselectedtipstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/multisetstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/pruningstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/reachabilitydatastore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/datastructures/utxodiffstore"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/testapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/blockbuilder"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/blockprocessor"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/blockvalidator"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/coinbasemanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/consensusstatemanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/dagtopologymanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/dagtraversalmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/difficultymanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/finalitymanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/ghostdagmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/headersselectedtipmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/mergedepthmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/pastmediantimemanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/pruningmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/reachabilitymanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/syncmanager"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/processes/transactionvalidator"
+	"github.com/HoosatNetwork/HTND/v2/domain/dagconfig"
+	infrastructuredatabase "github.com/HoosatNetwork/HTND/v2/infrastructure/db/database"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/db/database/ldb"
+)
+
+const (
+	defaultTestLeveldbCacheSizeMiB = 8
+	defaultPreallocateCaches       = true
+	defaultTestPreallocateCaches   = false
+)
+
+// Config is the full config required to run consensus
+type Config struct {
+	dagconfig.Params
+	// IsArchival tells the consensus if it should not prune old blocks
+	IsArchival bool
+	// EnableSanityCheckPruningUTXOSet checks the full pruning point utxo set against the commitment at every pruning movement
+	EnableSanityCheckPruningUTXOSet             bool
+	RefuseMismatchedImportedPruningPointUTXOSet bool
+	// EnableUTXODebugDiagnostics runs the expensive [UTXO-DEBUG] startup self-consistency checks
+	// (VerifyCurrentPruningPointUTXOSet, FindAndReproduceRootDisqualification) - each pass can take
+	// 15-20+ minutes on a mature chain. Off by default; only for actively investigating a UTXO
+	// commitment mismatch.
+	EnableUTXODebugDiagnostics bool
+	// RepairBlockStatuses re-marks every block that is neither invalid nor header-only as UTXO-valid
+	// at startup, to get a node that has disqualified its whole chain back to a state where it can
+	// process blocks again. It walks every block in the store with the status cache cleared and
+	// commits each changed status on its own, which on a mature or archival node takes long enough
+	// that the node does not reach the point of listening for RPC - so it is a recovery step to ask
+	// for, not something to pay for on every boot.
+	RepairBlockStatuses bool
+	// RepairMissingMultisets marks StatusUTXOPendingVerification any StatusUTXOValid block reachable
+	// from a virtual tip that has no stored multiset - the state RepairBlockStatuses (or a past
+	// incident of the same shape) can leave behind - so the normal resolve path re-derives a real
+	// diff and multiset for it. Needed to recover a node stuck unable to build any further block
+	// template ("Multiset <hash> does not exist in db") because virtual's own selected parent is one
+	// of these blocks. A recovery step to ask for, like RepairBlockStatuses, not something to run on
+	// every boot.
+	RepairMissingMultisets bool
+
+	SkipAddingGenesis bool
+
+	// DeletionDepth specifies the depth for block deletion during pruning
+	DeletionDepth uint64
+
+	// DataRetentionDuration specifies the minimum duration of chain data to keep
+	// before allowing pruning deletion. Zero means prune immediately as normal.
+	DataRetentionDuration time.Duration
+
+	// PruningInterval specifies the minimum duration between pruning deletions.
+	// Zero means prune at every pruning point update as normal.
+	PruningInterval time.Duration
+
+	// UseHoohashCLibrary indicates whether to use the hoohash C library for block versions >= 5
+	UseHoohashCLibrary bool
+
+	// PastMedianTimeValidationTolerance is the tolerance in milliseconds for past median time validation
+	PastMedianTimeValidationTolerance int
+
+	// MaxConsecutiveDisqualifiedBlocks is how many blocks in a row may come out of a virtual-updating
+	// insertion as StatusDisqualifiedFromChain before OnDisqualifiedBlockStreak is called. Zero
+	// disables the check.
+	MaxConsecutiveDisqualifiedBlocks int
+	// OnDisqualifiedBlockStreak is called once, under the consensus lock, when the streak reaches
+	// MaxConsecutiveDisqualifiedBlocks. It must not block or call back into consensus.
+	OnDisqualifiedBlockStreak func(streak int, lastBlock *externalapi.DomainHash)
+}
+
+// Factory instantiates new Consensuses
+type Factory interface {
+	NewConsensus(config *Config, db infrastructuredatabase.Database, dbPrefix *prefix.Prefix,
+		consensusEventsChan chan externalapi.ConsensusEvent) (
+		externalapi.Consensus, bool, error)
+	NewTestConsensus(config *Config, testName string) (
+		tc testapi.TestConsensus, teardown func(keepDataDir bool), err error)
+
+	SetTestDataDir(dataDir string)
+	SetTestGHOSTDAGManager(ghostdagConstructor GHOSTDAGManagerConstructor)
+	SetTestLevelDBCacheSize(cacheSizeMiB int)
+	SetTestPreAllocateCache(preallocateCaches bool)
+	SetTestPastMedianTimeManager(medianTimeConstructor PastMedianTimeManagerConstructor)
+	SetTestDifficultyManager(difficultyConstructor DifficultyManagerConstructor)
+}
+
+type factory struct {
+	dataDir                  string
+	ghostdagConstructor      GHOSTDAGManagerConstructor
+	pastMedianTimeConsructor PastMedianTimeManagerConstructor
+	difficultyConstructor    DifficultyManagerConstructor
+	cacheSizeMiB             *int
+	preallocateCaches        *bool
+}
+
+// NewFactory creates a new Consensus factory
+func NewFactory() Factory {
+	return &factory{
+		ghostdagConstructor:      ghostdagmanager.New,
+		pastMedianTimeConsructor: pastmediantimemanager.New,
+		difficultyConstructor:    difficultymanager.New,
+	}
+}
+
+// NewConsensus instantiates a new Consensus
+func (f *factory) NewConsensus(config *Config, db infrastructuredatabase.Database, dbPrefix *prefix.Prefix,
+	consensusEventsChan chan externalapi.ConsensusEvent) (
+	consensusInstance externalapi.Consensus, shouldMigrate bool, err error,
+) {
+	// Set the global flag for using hoohash C library
+	pow.SetUseHoohashCLibrary(config.UseHoohashCLibrary)
+
+	dbManager := consensusdatabase.New(db)
+	prefixBucket := consensusdatabase.MakeBucket(dbPrefix.Serialize())
+
+	largeCacheDivisor := 1
+	if v := os.Getenv("HTND_LARGE_CACHE_DIVISOR"); v != "" {
+		if divisor, err := strconv.Atoi(v); err == nil && divisor > 0 {
+			if divisor > 50 {
+				divisor = 50
+			}
+			largeCacheDivisor = divisor << 20
+		}
+	}
+
+	pruningDepth := config.PruningDepth()
+	if pruningDepth > uint64(math.MaxInt) {
+		panic("PruningDepth overflows int")
+	}
+	pruningWindowSizeForCaches := int(pruningDepth) / largeCacheDivisor
+
+	finalityDepth := config.FinalityDepth()
+	if finalityDepth > uint64(math.MaxInt) {
+		panic("FinalityDepth overflows int")
+	}
+	finalityWindowSizeForCaches := int(finalityDepth) / largeCacheDivisor
+	// This is used for caches that are used as part of deletePastBlocks that need to traverse until
+	// the previous pruning point.
+	pruningWindowSizePlusFinalityDepthForCache := int(pruningWindowSizeForCaches + finalityWindowSizeForCaches)
+	log.Infof("Largest cache sizes %d, %d, %d", finalityWindowSizeForCaches, pruningWindowSizeForCaches, pruningWindowSizePlusFinalityDepthForCache)
+
+	var preallocateCaches bool
+	if f.preallocateCaches != nil {
+		preallocateCaches = *f.preallocateCaches
+	} else {
+		preallocateCaches = defaultPreallocateCaches
+	}
+
+	// Data Structures
+	mergeDepthRootStore := mergedepthrootstore.New(prefixBucket, 1000, preallocateCaches)
+	daaWindowStore := daawindowstore.New(prefixBucket, 50_000, preallocateCaches)
+	acceptanceDataStore := acceptancedatastore.New(prefixBucket, 1000, preallocateCaches)
+	blockStore, err := blockstore.New(dbManager, prefixBucket, 10_000, preallocateCaches)
+	if err != nil {
+		return nil, false, err
+	}
+	blockHeaderStore, err := blockheaderstore.New(dbManager, prefixBucket, 10_000, preallocateCaches)
+	if err != nil {
+		return nil, false, err
+	}
+
+	blockStatusStore := blockstatusstore.New(prefixBucket, pruningWindowSizePlusFinalityDepthForCache, preallocateCaches)
+	multisetStore := multisetstore.New(prefixBucket, 1000, preallocateCaches)
+	pruningStore := pruningstore.New(prefixBucket, 2, preallocateCaches)
+	utxoDiffStore := utxodiffstore.New(prefixBucket, 250_000, preallocateCaches)
+	consensusStateStore := consensusstatestore.New(prefixBucket, 50_000, preallocateCaches)
+
+	headersSelectedTipStore := headersselectedtipstore.New(prefixBucket)
+	finalityStore := finalitystore.New(prefixBucket, 1000, preallocateCaches)
+	headersSelectedChainStore := headersselectedchainstore.New(prefixBucket, pruningWindowSizeForCaches, preallocateCaches)
+	daaBlocksStore := daablocksstore.New(prefixBucket, pruningWindowSizeForCaches, finalityWindowSizeForCaches, preallocateCaches)
+	windowHeapSliceStore := blockwindowheapslicestore.New(10_000, preallocateCaches)
+
+	newReachabilityDataStore := reachabilitydatastore.New(prefixBucket, pruningWindowSizePlusFinalityDepthForCache*2, preallocateCaches)
+	blockRelationStores, reachabilityDataStores, ghostdagDataStores := dagStores(config, prefixBucket, pruningWindowSizePlusFinalityDepthForCache, pruningWindowSizeForCaches, preallocateCaches)
+	oldReachabilityManager := reachabilitymanager.New(
+		dbManager,
+		ghostdagDataStores[0],
+		reachabilityDataStores[0])
+	isOldReachabilityInitialized, err := reachabilityDataStores[0].HasReachabilityData(dbManager, model.NewStagingArea(), model.VirtualGenesisBlockHash)
+	if err != nil {
+		return nil, false, err
+	}
+
+	newReachabilityManager := reachabilitymanager.New(
+		dbManager,
+		ghostdagDataStores[0],
+		newReachabilityDataStore)
+	reachabilityManager := newReachabilityManager
+	if isOldReachabilityInitialized {
+		reachabilityManager = oldReachabilityManager
+	} else {
+		for i := range reachabilityDataStores {
+			reachabilityDataStores[i] = newReachabilityDataStore
+		}
+	}
+	reachabilityDataStore := reachabilityDataStores[0]
+
+	dagTopologyManagers, ghostdagManagers, dagTraversalManagers := f.dagProcesses(config, dbManager, blockHeaderStore, daaWindowStore, windowHeapSliceStore, blockRelationStores, reachabilityDataStores, ghostdagDataStores, consensusStateStore, daaBlocksStore, isOldReachabilityInitialized)
+
+	blockRelationStore := blockRelationStores[0]
+
+	ghostdagDataStore := ghostdagDataStores[0]
+
+	dagTopologyManager := dagTopologyManagers[0]
+	ghostdagManager := ghostdagManagers[0]
+	dagTraversalManager := dagTraversalManagers[0]
+	// Processes
+	parentsManager := parentssanager.New(config.GenesisHash, config.MaxBlockLevel)
+
+	txMassCalculator := txmass.NewCalculator(config.MassPerTxByte, config.MassPerScriptPubKeyByte, config.MassPerSigOp)
+
+	pastMedianTimeManager := f.pastMedianTimeConsructor(
+		config.TimestampDeviationTolerance,
+		dbManager,
+		dagTraversalManager,
+		blockHeaderStore,
+		ghostdagDataStore,
+		config.GenesisHash)
+	transactionValidator := transactionvalidator.New(config.BlockCoinbaseMaturity,
+		config.EnableNonNativeSubnetworks,
+		config.MaxCoinbasePayloadLength,
+		config.MergeSetSizeLimit,
+		config.CoinbasePayloadScriptPublicKeyMaxLength,
+		dbManager,
+		pastMedianTimeManager,
+		ghostdagDataStore,
+		daaBlocksStore,
+		txMassCalculator)
+	difficultyManager := f.difficultyConstructor(
+		dbManager,
+		ghostdagManager,
+		ghostdagDataStore,
+		blockHeaderStore,
+		daaBlocksStore,
+		dagTopologyManager,
+		dagTraversalManager,
+		config.PowMax,
+		config.DifficultyAdjustmentWindowSize,
+		config.DisableDifficultyAdjustment,
+		config.TargetTimePerBlock,
+		config.GenesisHash,
+		config.GenesisBlock.Header.Bits(),
+		config.POWScores)
+	coinbaseManager := coinbasemanager.New(
+		dbManager,
+		config.SubsidyGenesisReward,
+		config.PreDeflationaryPhaseBaseSubsidy,
+		config.CoinbasePayloadScriptPublicKeyMaxLength,
+		config.GenesisHash,
+		config.DeflationaryPhaseDaaScore,
+		config.DeflationaryPhaseBaseSubsidy,
+		config.DeflationaryPhaseCurveFactor,
+		config.TargetTimePerBlock,
+
+		dagTraversalManager,
+		ghostdagDataStore,
+		acceptanceDataStore,
+		daaBlocksStore,
+		blockStore,
+		pruningStore,
+		blockHeaderStore,
+		config.POWScores)
+	headerTipsManager := headersselectedtipmanager.New(dbManager, dagTopologyManager, dagTraversalManager,
+		ghostdagManager, headersSelectedTipStore, headersSelectedChainStore)
+	genesisHash := config.GenesisHash
+
+	finalityManager := finalitymanager.New(
+		dbManager,
+		dagTopologyManager,
+		finalityStore,
+		ghostdagDataStore,
+		pruningStore,
+		headersSelectedTipStore,
+		daaBlocksStore,
+		genesisHash,
+		config.POWScores,
+		config.FinalityDepthForBlockVersion)
+	mergeDepthManager := mergedepthmanager.New(
+		dbManager,
+		dagTopologyManager,
+		dagTraversalManager,
+		finalityManager,
+		genesisHash,
+		config.MergeDepth,
+		config.POWScores,
+		ghostdagDataStore,
+		mergeDepthRootStore,
+		daaBlocksStore,
+		pruningStore,
+		finalityStore)
+	consensusStateManager, err := consensusstatemanager.New(
+		dbManager,
+		config.MaxBlockParents,
+		config.MergeSetSizeLimit,
+		genesisHash,
+
+		ghostdagManager,
+		dagTopologyManager,
+		dagTraversalManager,
+		pastMedianTimeManager,
+		transactionValidator,
+		coinbaseManager,
+		mergeDepthManager,
+		finalityManager,
+		difficultyManager,
+
+		blockStatusStore,
+		ghostdagDataStore,
+		consensusStateStore,
+		multisetStore,
+		blockStore,
+		utxoDiffStore,
+		blockRelationStore,
+		acceptanceDataStore,
+		blockHeaderStore,
+		headersSelectedTipStore,
+		pruningStore,
+		daaBlocksStore,
+		finalityStore,
+		headersSelectedChainStore,
+		mergeDepthRootStore,
+		windowHeapSliceStore,
+		5000,
+		config.RefuseMismatchedImportedPruningPointUTXOSet,
+		config.POWScores)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var c *consensus
+
+	pruningManager := pruningmanager.New(
+		dbManager,
+		dagTraversalManager,
+		dagTopologyManager,
+		consensusStateManager,
+		finalityManager,
+
+		consensusStateStore,
+		ghostdagDataStore,
+		pruningStore,
+		blockStatusStore,
+		headersSelectedTipStore,
+		multisetStore,
+		acceptanceDataStore,
+		blockStore,
+		blockHeaderStore,
+		utxoDiffStore,
+		daaBlocksStore,
+		reachabilityDataStore,
+		daaWindowStore,
+
+		config.IsArchival,
+		genesisHash,
+		config.POWScores,
+		config.FinalityDepthForBlockVersion,
+		config.PruningDepthForBlockVersion,
+		config.DeletionDepth,
+		config.DataRetentionDuration,
+		config.PruningInterval,
+		config.EnableSanityCheckPruningUTXOSet,
+		nil,
+		config.K,
+		config.DifficultyAdjustmentWindowSize,
+		config.TargetTimePerBlock,
+	)
+
+	blockParentBuilder := blockparentbuilder.New(
+		dbManager,
+		blockHeaderStore,
+		blockStatusStore,
+		dagTopologyManager,
+		parentsManager,
+		consensusStateManager,
+		reachabilityDataStore,
+		pruningStore,
+
+		config.GenesisHash,
+		config.MaxBlockLevel,
+	)
+
+	blockValidator := blockvalidator.New(
+		config.PowMax,
+		config.SkipProofOfWork,
+		genesisHash,
+		config.EnableNonNativeSubnetworks,
+		config.MaxBlockMass,
+		config.MergeSetSizeLimit,
+		config.MaxBlockParents,
+		config.TimestampDeviationTolerance,
+		config.TargetTimePerBlock,
+		config.POWScores,
+		config.MaxBlockLevel,
+		config.PastMedianTimeValidationTolerance,
+
+		dbManager,
+		difficultyManager,
+		pastMedianTimeManager,
+		transactionValidator,
+		ghostdagManagers,
+		dagTopologyManagers,
+		dagTraversalManager,
+		coinbaseManager,
+		mergeDepthManager,
+		reachabilityManager,
+		finalityManager,
+		blockParentBuilder,
+		pruningManager,
+		parentsManager,
+
+		pruningStore,
+		blockStore,
+		ghostdagDataStores,
+		blockHeaderStore,
+		blockStatusStore,
+		reachabilityDataStore,
+		consensusStateStore,
+		daaBlocksStore,
+
+		txMassCalculator,
+	)
+
+	syncManager := syncmanager.New(
+		dbManager,
+		genesisHash,
+		config.MergeSetSizeLimit,
+		dagTraversalManager,
+		dagTopologyManager,
+		ghostdagManager,
+		pruningManager,
+
+		ghostdagDataStore,
+		blockStatusStore,
+		blockHeaderStore,
+		blockStore,
+		pruningStore,
+		headersSelectedChainStore)
+
+	blockBuilder := blockbuilder.New(
+		dbManager,
+		genesisHash,
+		config.POWScores,
+
+		difficultyManager,
+		pastMedianTimeManager,
+		coinbaseManager,
+		consensusStateManager,
+		ghostdagManager,
+		transactionValidator,
+		finalityManager,
+		blockParentBuilder,
+		pruningManager,
+
+		acceptanceDataStore,
+		blockRelationStore,
+		multisetStore,
+		ghostdagDataStore,
+		daaBlocksStore,
+	)
+
+	blockProcessor := blockprocessor.New(
+		genesisHash,
+		config.POWScores,
+		config.TargetTimePerBlock,
+		config.MaxBlockLevel,
+		dbManager,
+		consensusStateManager,
+		pruningManager,
+		blockValidator,
+		dagTopologyManager,
+		reachabilityManager,
+		difficultyManager,
+		pastMedianTimeManager,
+		coinbaseManager,
+		headerTipsManager,
+		syncManager,
+
+		acceptanceDataStore,
+		blockStore,
+		blockStatusStore,
+		blockRelationStore,
+		multisetStore,
+		ghostdagDataStore,
+		consensusStateStore,
+		pruningStore,
+		reachabilityDataStore,
+		utxoDiffStore,
+		blockHeaderStore,
+		headersSelectedTipStore,
+		finalityStore,
+		headersSelectedChainStore,
+		daaBlocksStore,
+		daaWindowStore)
+
+	pruningProofManager := pruningproofmanager.New(
+		dbManager,
+		dagTopologyManagers,
+		ghostdagManagers,
+		reachabilityManager,
+		dagTraversalManagers,
+		parentsManager,
+		pruningManager,
+
+		ghostdagDataStores,
+		pruningStore,
+		blockHeaderStore,
+		blockStatusStore,
+		finalityStore,
+		consensusStateStore,
+		blockRelationStore,
+		reachabilityDataStore,
+
+		genesisHash,
+		config.K,
+		config.PruningProofM,
+		config.MaxBlockLevel,
+		config.POWScores,
+	)
+
+	c = &consensus{
+		lock:            &sync.Mutex{},
+		databaseContext: dbManager,
+		genesisBlock:    config.GenesisBlock,
+		genesisHash:     config.GenesisHash,
+
+		// Kept as the raw per-version tables. Do NOT precompute a single window here: the active block
+		// version is not yet known at construction time (constants.GetBlockVersion() is still 1 for a
+		// consensus built at startup, and already 6 for a staging consensus built mid-IBD), and nothing
+		// would ever recompute it. See consensus.expectedDAAWindowDurationInMilliseconds.
+		targetTimePerBlock:             config.TargetTimePerBlock,
+		difficultyAdjustmentWindowSize: config.DifficultyAdjustmentWindowSize,
+		powScores:                      config.POWScores,
+
+		blockProcessor:        blockProcessor,
+		blockBuilder:          blockBuilder,
+		consensusStateManager: consensusStateManager,
+		transactionValidator:  transactionValidator,
+		syncManager:           syncManager,
+		pastMedianTimeManager: pastMedianTimeManager,
+		blockValidator:        blockValidator,
+		coinbaseManager:       coinbaseManager,
+		dagTopologyManagers:   dagTopologyManagers,
+		dagTraversalManager:   dagTraversalManager,
+		difficultyManager:     difficultyManager,
+		ghostdagManagers:      ghostdagManagers,
+		headerTipsManager:     headerTipsManager,
+		mergeDepthManager:     mergeDepthManager,
+		pruningManager:        pruningManager,
+		reachabilityManager:   reachabilityManager,
+		finalityManager:       finalityManager,
+		pruningProofManager:   pruningProofManager,
+
+		acceptanceDataStore:                 acceptanceDataStore,
+		blockStore:                          blockStore,
+		blockHeaderStore:                    blockHeaderStore,
+		pruningStore:                        pruningStore,
+		ghostdagDataStores:                  ghostdagDataStores,
+		blockStatusStore:                    blockStatusStore,
+		blockRelationStores:                 blockRelationStores,
+		consensusStateStore:                 consensusStateStore,
+		headersSelectedTipStore:             headersSelectedTipStore,
+		multisetStore:                       multisetStore,
+		reachabilityDataStore:               reachabilityDataStore,
+		utxoDiffStore:                       utxoDiffStore,
+		finalityStore:                       finalityStore,
+		headersSelectedChainStore:           headersSelectedChainStore,
+		daaBlocksStore:                      daaBlocksStore,
+		blocksWithTrustedDataDAAWindowStore: daaWindowStore,
+		windowHeapSliceStore:                windowHeapSliceStore,
+
+		consensusEventsChan: consensusEventsChan,
+		virtualNotUpdated:   true,
+
+		disqualificationStreak: disqualificationStreak{
+			threshold: config.MaxConsecutiveDisqualifiedBlocks,
+			onReached: config.OnDisqualifiedBlockStreak,
+		},
+	}
+
+	if isOldReachabilityInitialized {
+		return c, true, nil
+	}
+
+	err = c.Init(config.SkipAddingGenesis)
+	if err != nil {
+		return nil, false, err
+	}
+
+	err = consensusStateManager.RecoverUTXOIfRequired()
+	if err != nil {
+		return nil, false, err
+	}
+	err = pruningManager.ClearImportedPruningPointData()
+	if err != nil {
+		return nil, false, err
+	}
+	err = pruningManager.UpdatePruningPointIfRequired()
+	if err != nil {
+		return nil, false, err
+	}
+
+	// If the virtual moved before shutdown but the pruning point hasn't, we
+	// move it if needed.
+	stagingArea := model.NewStagingArea()
+	err = pruningManager.UpdatePruningPointByVirtual(stagingArea)
+	if err != nil {
+		return nil, false, err
+	}
+
+	err = staging.CommitAllChanges(dbManager, stagingArea)
+	if err != nil {
+		return nil, false, err
+	}
+
+	if config.RepairBlockStatuses {
+		err = c.RepairBlockStatuses()
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if config.RepairMissingMultisets {
+		resetCount, err := c.RepairMissingMultisets()
+		if err != nil {
+			return nil, false, err
+		}
+		log.Infof("RepairMissingMultisets marked %d block(s) for re-verification", resetCount)
+	}
+	// c.ReresolveInvalidBlocks()
+	// hash, err := externalapi.NewDomainHashFromString("3ba7ac9a1d0f8262ba05e3e5c00fab85ffc9ce9ed8ddfaec6709615af7a6c531")
+	// if err != nil {
+	// 	return nil, false, err
+	// }
+	// err = c.CheckMergeSetBluesAndIfBlockExistsInThem(hash)
+	// if err != nil {
+	// 	return nil, false, err
+	// }
+
+	err = pruningManager.UpdatePruningPointIfRequired()
+	if err != nil {
+		return nil, false, err
+	}
+
+	health, err := c.UTXOSetHealth()
+	if err != nil {
+		return nil, false, err
+	}
+	if health != nil && health.Checked && !health.BaselineVerified {
+		log.Errorf("refusing to start: stored pruning-point set does not match the header. "+
+			"pruning point %s, stored multiset %s, header commitment %s. "+
+			"This datadir is not a consistent ledger. Remove it and sync from a peer whose set hashes to the commitment.",
+			health.PruningPoint, health.StoredMultiset, health.HeaderCommitment)
+		return nil, false, errors.Errorf("stored pruning-point set does not match the header commitment "+
+			"(pruning point %s, stored %s, header %s)",
+			health.PruningPoint, health.StoredMultiset, health.HeaderCommitment)
+	}
+
+	// [UTXO-DEBUG] Gated behind --enable-utxo-debug-diagnostics: each of these can take 15-20+
+	// minutes on a mature chain (multiple full UTXO-set scans), and produce the same result on every
+	// boot until the underlying data actually changes - not something to run unconditionally on
+	// every startup. Only for actively investigating a UTXO commitment mismatch.
+	if config.EnableUTXODebugDiagnostics {
+		// Checks this node's CURRENT pruningPointUTXOSetBucket - what it serves to any syncing peer
+		// right now - against its own pruning point's header commitment. See
+		// VerifyCurrentPruningPointUTXOSet's comment.
+		pruningManager.VerifyCurrentPruningPointUTXOSet()
+
+		// Finds whatever block is the actual root of any already-persisted disqualification cascade
+		// and re-resolves it directly, so its original verifyUTXO failure (and diagnostics) fire
+		// again even though normal resolution - including a completely fresh IBD run - would just
+		// cascade past it silently from here on. See FindAndReproduceRootDisqualification's comment.
+		pruningManager.FindAndReproduceRootDisqualification(model.NewStagingArea())
+	}
+
+	return c, false, nil
+}
+
+func (f *factory) NewTestConsensus(config *Config, testName string) (
+	tc testapi.TestConsensus, teardown func(keepDataDir bool), err error,
+) {
+	datadir := f.dataDir
+	if datadir == "" {
+		// Prefer a repo-local temp dir to avoid relying on system temp space (e.g. /tmp)
+		// which can be constrained in CI and containerized environments.
+		fallbackBase := filepath.Join(".", ".tmp")
+		if mkErr := os.MkdirAll(fallbackBase, 0o755); mkErr == nil {
+			datadir, err = os.MkdirTemp(fallbackBase, testName)
+		}
+		if err != nil {
+			// As a last resort, fall back to the system temp directory.
+			datadir, err = os.MkdirTemp("", testName)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	var cacheSizeMiB int
+	if f.cacheSizeMiB != nil {
+		cacheSizeMiB = *f.cacheSizeMiB
+	} else {
+		cacheSizeMiB = defaultTestLeveldbCacheSizeMiB
+	}
+	if f.preallocateCaches == nil {
+		f.SetTestPreAllocateCache(defaultTestPreallocateCaches)
+	}
+	db, err := ldb.NewLevelDB(datadir, cacheSizeMiB)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	testConsensusDBPrefix := &prefix.Prefix{}
+	constants.ForceSetBlockVersion(1)
+	consensusAsInterface, shouldMigrate, err := f.NewConsensus(config, db, testConsensusDBPrefix, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	constants.ForceSetBlockVersion(1)
+
+	if shouldMigrate {
+		return nil, nil, errors.Errorf("A fresh consensus should never return shouldMigrate=true")
+	}
+
+	consensusAsImplementation := consensusAsInterface.(*consensus)
+	testConsensusStateManager := consensusstatemanager.NewTestConsensusStateManager(consensusAsImplementation.consensusStateManager)
+	testTransactionValidator := transactionvalidator.NewTestTransactionValidator(consensusAsImplementation.transactionValidator)
+
+	tstConsensus := &testConsensus{
+		dagParams:                 &config.Params,
+		consensus:                 consensusAsImplementation,
+		database:                  db,
+		testConsensusStateManager: testConsensusStateManager,
+		testReachabilityManager: reachabilitymanager.NewTestReachabilityManager(consensusAsImplementation.
+			reachabilityManager),
+		testTransactionValidator: testTransactionValidator,
+	}
+	tstConsensus.testBlockBuilder = blockbuilder.NewTestBlockBuilder(consensusAsImplementation.blockBuilder, tstConsensus)
+	teardown = func(keepDataDir bool) {
+		db.Close()
+		if !keepDataDir {
+			err := os.RemoveAll(datadir)
+			if err != nil {
+				log.Errorf("Error removing data directory for test consensus: %s", err)
+			}
+		}
+	}
+	return tstConsensus, teardown, nil
+}
+
+func (f *factory) SetTestDataDir(dataDir string) {
+	f.dataDir = dataDir
+}
+
+func (f *factory) SetTestGHOSTDAGManager(ghostdagConstructor GHOSTDAGManagerConstructor) {
+	f.ghostdagConstructor = ghostdagConstructor
+}
+
+func (f *factory) SetTestPastMedianTimeManager(medianTimeConstructor PastMedianTimeManagerConstructor) {
+	f.pastMedianTimeConsructor = medianTimeConstructor
+}
+
+// SetTestDifficultyManager is a setter for the difficultyManager field on the factory.
+func (f *factory) SetTestDifficultyManager(difficultyConstructor DifficultyManagerConstructor) {
+	f.difficultyConstructor = difficultyConstructor
+}
+
+func (f *factory) SetTestLevelDBCacheSize(cacheSizeMiB int) {
+	f.cacheSizeMiB = &cacheSizeMiB
+}
+
+func (f *factory) SetTestPreAllocateCache(preallocateCaches bool) {
+	f.preallocateCaches = &preallocateCaches
+}
+
+func dagStores(config *Config,
+	prefixBucket model.DBBucket,
+	pruningWindowSizePlusFinalityDepthForCache, pruningWindowSizeForCaches int,
+	preallocateCaches bool,
+) ([]model.BlockRelationStore, []model.ReachabilityDataStore, []model.GHOSTDAGDataStore) {
+	blockRelationStores := make([]model.BlockRelationStore, config.MaxBlockLevel+1)
+	reachabilityDataStores := make([]model.ReachabilityDataStore, config.MaxBlockLevel+1)
+	ghostdagDataStores := make([]model.GHOSTDAGDataStore, config.MaxBlockLevel+1)
+
+	ghostdagDataCacheSize := max(pruningWindowSizeForCaches*2, config.DifficultyAdjustmentWindowSizeForCurrentVersion())
+
+	for i := 0; i <= config.MaxBlockLevel; i++ {
+		prefixBucket := prefixBucket.Bucket([]byte{byte(i)})
+		if i == 0 {
+			blockRelationStores[i] = blockrelationstore.New(prefixBucket, pruningWindowSizePlusFinalityDepthForCache, preallocateCaches)
+			reachabilityDataStores[i] = reachabilitydatastore.New(prefixBucket, pruningWindowSizePlusFinalityDepthForCache*2, preallocateCaches)
+			ghostdagDataStores[i] = ghostdagdatastore.New(prefixBucket, ghostdagDataCacheSize, preallocateCaches)
+		} else {
+			blockRelationStores[i] = blockrelationstore.New(prefixBucket, 1000, false)
+			reachabilityDataStores[i] = reachabilitydatastore.New(prefixBucket, pruningWindowSizePlusFinalityDepthForCache, false)
+			ghostdagDataStores[i] = ghostdagdatastore.New(prefixBucket, 1000, false)
+		}
+	}
+
+	return blockRelationStores, reachabilityDataStores, ghostdagDataStores
+}
+
+func (f *factory) dagProcesses(config *Config,
+	dbManager model.DBManager,
+	blockHeaderStore model.BlockHeaderStore,
+	daaWindowStore model.BlocksWithTrustedDataDAAWindowStore,
+	windowHeapSliceStore model.WindowHeapSliceStore,
+	blockRelationStores []model.BlockRelationStore,
+	reachabilityDataStores []model.ReachabilityDataStore,
+	ghostdagDataStores []model.GHOSTDAGDataStore,
+	consensusStateStore model.ConsensusStateStore,
+	daaBlocksStore model.DAABlocksStore,
+	isOldReachabilityInitialized bool) (
+	[]model.DAGTopologyManager,
+	[]model.GHOSTDAGManager,
+	[]model.DAGTraversalManager,
+) {
+	reachabilityManagers := make([]model.ReachabilityManager, config.MaxBlockLevel+1)
+	dagTopologyManagers := make([]model.DAGTopologyManager, config.MaxBlockLevel+1)
+	ghostdagManagers := make([]model.GHOSTDAGManager, config.MaxBlockLevel+1)
+	dagTraversalManagers := make([]model.DAGTraversalManager, config.MaxBlockLevel+1)
+
+	newReachabilityManager := reachabilitymanager.New(
+		dbManager,
+		ghostdagDataStores[0],
+		reachabilityDataStores[0])
+
+	for i := 0; i <= config.MaxBlockLevel; i++ {
+		if isOldReachabilityInitialized {
+			reachabilityManagers[i] = reachabilitymanager.New(
+				dbManager,
+				ghostdagDataStores[i],
+				reachabilityDataStores[i])
+		} else {
+			reachabilityManagers[i] = newReachabilityManager
+		}
+
+		dagTopologyManagers[i] = dagtopologymanager.New(
+			dbManager,
+			reachabilityManagers[i],
+			blockRelationStores[i],
+			ghostdagDataStores[i])
+
+		ghostdagManagers[i] = f.ghostdagConstructor(
+			dbManager,
+			dagTopologyManagers[i],
+			dagTraversalManagers[i],
+			ghostdagDataStores[i],
+			blockHeaderStore,
+			consensusStateStore,
+			config.K,
+			config.GenesisHash,
+			daaBlocksStore,
+			config.POWScores)
+
+		dagTraversalManagers[i] = dagtraversalmanager.New(
+			dbManager,
+			dagTopologyManagers[i],
+			ghostdagDataStores[i],
+			reachabilityManagers[i],
+			ghostdagManagers[i],
+			daaWindowStore,
+			windowHeapSliceStore,
+			config.GenesisHash,
+			config.DifficultyAdjustmentWindowSize,
+			daaBlocksStore,
+			config.POWScores)
+		// Set the DAG traversal manager in the ghostdag manager to resolve circular dependency
+		ghostdagManagers[i].SetDAGTraversalManager(dagTraversalManagers[i])
+	}
+
+	return dagTopologyManagers, ghostdagManagers, dagTraversalManagers
+}

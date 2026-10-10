@@ -1,0 +1,31 @@
+package consensus
+
+import (
+	"math/big"
+	"time"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+)
+
+// GHOSTDAGManagerConstructor is the function signature for a constructor of a type implementing model.GHOSTDAGManager
+type GHOSTDAGManagerConstructor func(
+	databaseContext model.DBReader,
+	dagTopologyManager model.DAGTopologyManager,
+	dagTraversalManager model.DAGTraversalManager,
+	ghostdagDataStore model.GHOSTDAGDataStore,
+	headerStore model.BlockHeaderStore,
+	consensusStateStore model.ConsensusStateStore,
+	k []externalapi.KType,
+	genesisHash *externalapi.DomainHash,
+	daaBlocksStore model.DAABlocksStore,
+	powScores []uint64) model.GHOSTDAGManager
+
+// DifficultyManagerConstructor is the function signature for a constructor of a type implementing model.DifficultyManager
+type DifficultyManagerConstructor func(model.DBReader, model.GHOSTDAGManager, model.GHOSTDAGDataStore,
+	model.BlockHeaderStore, model.DAABlocksStore, model.DAGTopologyManager, model.DAGTraversalManager, *big.Int, []int, bool, []time.Duration,
+	*externalapi.DomainHash, uint32, []uint64) model.DifficultyManager
+
+// PastMedianTimeManagerConstructor is the function signature for a constructor of a type implementing model.PastMedianTimeManager
+type PastMedianTimeManagerConstructor func(int, model.DBReader, model.DAGTraversalManager, model.BlockHeaderStore,
+	model.GHOSTDAGDataStore, *externalapi.DomainHash) model.PastMedianTimeManager

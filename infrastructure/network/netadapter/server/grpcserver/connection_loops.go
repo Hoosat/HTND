@@ -1,0 +1,145 @@
+package grpcserver
+
+import (
+	"io"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/HoosatNetwork/HTND/v2/app/appmessage"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/logger"
+	"github.com/davecgh/go-spew/spew"
+
+	routerpkg "github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/router"
+	"github.com/pkg/errors"
+
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/server/grpcserver/protowire"
+)
+
+func (c *gRPCConnection) connectionLoops() error {
+	errChan := make(chan error, 2) // buffered channel because one of the loops might try write after disconnect
+
+	spawn("gRPCConnection.receiveLoop", func() { errChan <- c.receiveLoop() })
+	spawn("gRPCConnection.sendLoop", func() { errChan <- c.sendLoop() })
+
+	err := <-errChan
+
+	c.Disconnect()
+
+	return err
+}
+
+var (
+	blockDelayOnce sync.Once
+	blockDelay     = 0
+)
+
+func (c *gRPCConnection) sendLoop() error {
+	outgoingRoute := c.router.OutgoingRoute()
+	for c.IsConnected() {
+		message, err := outgoingRoute.Dequeue()
+		if err != nil {
+			if errors.Is(err, routerpkg.ErrRouteClosed) {
+				return nil
+			}
+			return err
+		}
+		if message == nil {
+			continue
+		}
+
+		blockDelayOnce.Do(func() {
+			experimentalDelayEnv := os.Getenv("HOOSAT_EXPERIMENTAL_DELAY")
+			if experimentalDelayEnv != "" {
+				blockDelay, err = strconv.Atoi(experimentalDelayEnv)
+				if err != nil {
+					panic(err)
+				}
+			}
+		})
+
+		if blockDelay != 0 && message.Command() == appmessage.CmdBlock {
+			time.Sleep(time.Duration(blockDelay) * time.Second)
+		}
+
+		log.Debugf("outgoing '%s' message to %s", message.Command(), c)
+		log.Tracef("outgoing '%s' message to %s: %s", message.Command(), c, logger.NewLogClosure(func() string {
+			return spew.Sdump(message)
+		}))
+
+		messageProto, err := protowire.FromAppMessage(message)
+		if err != nil {
+			return err
+		}
+
+		err = c.send(messageProto)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *gRPCConnection) receiveLoop() error {
+	messageNumber := uint64(0)
+	for c.IsConnected() {
+		protoMessage, err := c.receive()
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return err
+		}
+		message, err := protoMessage.ToAppMessage()
+		if err != nil {
+			if c.onInvalidMessageHandler != nil {
+				c.onInvalidMessageHandler(err)
+			}
+			return err
+		}
+		if message == nil {
+			continue
+		}
+
+		messageNumber++
+		message.SetMessageNumber(messageNumber)
+		message.SetReceivedAt(time.Now())
+
+		log.Debugf("incoming '%s' message from %s (message number %d)", message.Command(), c,
+			message.MessageNumber())
+
+		log.Tracef("incoming '%s' message from %s  (message number %d): %s", message.Command(),
+			c, message.MessageNumber(), logger.NewLogClosure(func() string {
+				return spew.Sdump(message)
+			}))
+
+		err = c.router.EnqueueIncomingMessage(message)
+		if err != nil {
+			if errors.Is(err, routerpkg.ErrRouteClosed) {
+				return nil
+			}
+
+			// Inv messages are optional and can arrive when the corresponding flow
+			// isn't active or is backpressured. Dropping them is better than
+			// disconnecting peers during heavy sync/IBD.
+			if message.Command() == appmessage.CmdInvRelayBlock || message.Command() == appmessage.CmdInvTransaction {
+				if errors.Is(err, routerpkg.ErrRouteDoesNotExist) || errors.Is(err, routerpkg.ErrRouteCapacityReached) {
+					log.Debugf("dropping incoming '%s' from %s: %s", message.Command(), c, err)
+					continue
+				}
+			}
+
+			// For other message types, a full route likely indicates the peer is
+			// overwhelming us or we're unable to make progress, so keep existing behavior.
+			if errors.Is(err, routerpkg.ErrRouteCapacityReached) {
+				return err
+			}
+			if c.onInvalidMessageHandler != nil {
+				c.onInvalidMessageHandler(err)
+			}
+			return err
+		}
+	}
+	return nil
+}

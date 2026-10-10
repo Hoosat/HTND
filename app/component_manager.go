@@ -1,0 +1,323 @@
+package app
+
+import (
+	"fmt"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/miningmanager/mempool"
+
+	"github.com/HoosatNetwork/HTND/v2/app/protocol"
+	"github.com/HoosatNetwork/HTND/v2/app/protocol/utxobaseline"
+	"github.com/HoosatNetwork/HTND/v2/app/rpc"
+	"github.com/HoosatNetwork/HTND/v2/domain"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus"
+	"github.com/HoosatNetwork/HTND/v2/domain/utxoindex"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/autoupdate"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/config"
+	infrastructuredatabase "github.com/HoosatNetwork/HTND/v2/infrastructure/db/database"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/addressmanager"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/connmanager"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter"
+	"github.com/HoosatNetwork/HTND/v2/infrastructure/network/netadapter/id"
+	"github.com/HoosatNetwork/HTND/v2/util"
+	"github.com/HoosatNetwork/HTND/v2/util/panics"
+	"github.com/pkg/errors"
+)
+
+func checkedDurationFromHours(value uint64) (time.Duration, error) {
+	parsedValue, err := strconv.ParseInt(strconv.FormatUint(value, 10), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(parsedValue) * time.Hour, nil
+}
+
+// warnAboutPersistentRepairFlags says loudly, at every start, that a one-shot recovery flag is set.
+//
+// Both flags are one-shot recovery steps, not settings. --repair-block-statuses in particular
+// caused a live outage: it was baked permanently into a docker-compose launch command instead of
+// being run once, and because it re-marks every non-invalid block as UTXO-valid it leaves blocks
+// that have no stored multiset. Virtual's own selected parent was one, so every GetBlockTemplate
+// call failed with "Multiset <hash> does not exist in db" and the pool's miners saw 0 H/s - with
+// nothing in the logs connecting that to a flag set weeks earlier.
+//
+// This is deliberately a warning on every boot rather than a startup refusal: a node mid-recovery
+// legitimately needs the flag, and failing to start would be worse than the problem. The point is
+// that leaving it in a launch command can no longer be silent.
+func warnAboutPersistentRepairFlags(cfg *config.Config) {
+	if cfg.RepairBlockStatuses {
+		log.Warnf("--repair-block-statuses is set. This is a ONE-SHOT recovery step, not a setting: " +
+			"it re-marks every block that is neither invalid nor header-only as UTXO-valid, which " +
+			"delays startup on a mature node and leaves UTXO-valid blocks with no stored multiset. " +
+			"Remove it from this node's launch command once the recovery run has finished - leaving " +
+			"it in place re-runs it on every restart.")
+	}
+	if cfg.RepairMissingMultisets {
+		log.Warnf("--repair-missing-multisets is set. This is a ONE-SHOT recovery step: remove it " +
+			"from this node's launch command after the run that reports how many blocks it marked " +
+			"for re-verification.")
+	}
+}
+
+// mergedAndValidatedFrozenAddresses combines the mempool's built-in frozen addresses with the ones
+// given via --freeze-address.
+//
+// --freeze-address is documented as "can be specified multiple times", which reads as adding to the
+// built-in frozen list, not replacing it - assigning cfg.FrozenAddresses outright used to silently
+// drop the built-in frozen address the moment an operator froze one more. Addresses are matched later
+// by exact string equality against EncodeAddress() (wallet_freezing_manager.go), so a mistyped,
+// differently cased, or wrong-network address froze nothing with no warning; validating here with the
+// same util.DecodeAddress every other address-taking flag uses catches that at startup instead of
+// silently freezing nothing.
+func mergedAndValidatedFrozenAddresses(defaults, extra []string, prefix util.Bech32Prefix) ([]string, error) {
+	for _, address := range extra {
+		if _, err := util.DecodeAddress(address, prefix); err != nil {
+			return nil, errors.Wrapf(err, "invalid --freeze-address %s", address)
+		}
+	}
+	return append(defaults, extra...), nil
+}
+
+// ComponentManager is a wrapper for all the htnd services
+type ComponentManager struct {
+	cfg               *config.Config
+	addressManager    *addressmanager.AddressManager
+	protocolManager   *protocol.Manager
+	rpcManager        *rpc.Manager
+	connectionManager *connmanager.ConnectionManager
+	netAdapter        *netadapter.NetAdapter
+	updater           *autoupdate.Updater
+
+	started, shutdown int32
+}
+
+// Start launches all the htnd services.
+func (a *ComponentManager) Start() {
+	// Already started?
+	if atomic.AddInt32(&a.started, 1) != 1 {
+		return
+	}
+
+	log.Trace("Starting htnd")
+
+	err := a.netAdapter.Start()
+	if err != nil {
+		panics.Exit(log, fmt.Sprintf("Error starting the net adapter: %+v", err))
+	}
+
+	a.connectionManager.Start()
+
+	// Start the auto-updater
+	if a.updater != nil {
+		a.updater.Start()
+	}
+}
+
+// Stop gracefully shuts down all the htnd services.
+func (a *ComponentManager) Stop() {
+	// Make sure this only happens once.
+	if atomic.AddInt32(&a.shutdown, 1) != 1 {
+		log.Infof("htnd is already in the process of shutting down")
+		return
+	}
+
+	log.Warnf("htnd shutting down")
+
+	// Stop the auto-updater first
+	if a.updater != nil {
+		a.updater.Stop()
+	}
+
+	// Stop RPC statistics tracking
+	rpc.RPCStats.Stop()
+
+	a.connectionManager.Stop()
+
+	err := a.netAdapter.Stop()
+	if err != nil {
+		log.Errorf("Error stopping the net adapter: %+v", err)
+	}
+
+	a.protocolManager.Close()
+	close(a.protocolManager.Context().Domain().ConsensusEventsChannel())
+
+	// The database is closed right after Stop returns. Let the RPC manager's consensus events handler apply the events
+	// still queued first - an IBD resolve leaves many - or it writes to the closed database, panics and exits the
+	// process with status 1. The wait is bounded to stay inside the caller's graceful shutdown timeout.
+	const consensusEventsDrainTimeout = 90 * time.Second
+	if !a.rpcManager.WaitForConsensusEventsHandler(consensusEventsDrainTimeout) {
+		log.Warnf("The consensus events handler did not finish within %s; closing the database anyway",
+			consensusEventsDrainTimeout)
+	}
+}
+
+// NewComponentManager returns a new ComponentManager instance.
+// Use Start() to begin all services within this ComponentManager
+func NewComponentManager(cfg *config.Config, db infrastructuredatabase.Database, interrupt chan<- struct{}) (
+	*ComponentManager, error,
+) {
+	dataRetentionDuration, err := checkedDurationFromHours(cfg.DataRetentionHours)
+	if err != nil {
+		return nil, err
+	}
+	pruningInterval, err := checkedDurationFromHours(cfg.PruningIntervalHours)
+	if err != nil {
+		return nil, err
+	}
+	warnAboutPersistentRepairFlags(cfg)
+
+	consensusConfig := consensus.Config{
+		Params:                          *cfg.ActiveNetParams,
+		IsArchival:                      cfg.IsArchivalNode,
+		DeletionDepth:                   cfg.DeletionDepth,
+		DataRetentionDuration:           dataRetentionDuration,
+		PruningInterval:                 pruningInterval,
+		EnableSanityCheckPruningUTXOSet: cfg.EnableSanityCheckPruningUTXOSet,
+		RefuseMismatchedImportedPruningPointUTXOSet: !cfg.AllowMismatchedPruningUTXO,
+		EnableUTXODebugDiagnostics:                  cfg.EnableUTXODebugDiagnostics,
+		RepairBlockStatuses:                         cfg.RepairBlockStatuses,
+		RepairMissingMultisets:                      cfg.RepairMissingMultisets,
+		UseHoohashCLibrary:                          cfg.UseHoohashCLibrary,
+		PastMedianTimeValidationTolerance:           cfg.PastMedianTimeValidationTolerance,
+		MaxConsecutiveDisqualifiedBlocks:            maxConsecutiveDisqualifiedBlocks,
+		OnDisqualifiedBlockStreak:                   recoverFromDisqualifiedBlockStreak,
+	}
+	mempoolConfig := mempool.DefaultConfig(&consensusConfig.Params)
+	mempoolConfig.MaximumOrphanTransactionCount = cfg.MaxOrphanTxs
+	mempoolConfig.MinimumRelayTransactionFee = cfg.MinRelayTxFee
+
+	// Configure compound transaction rate limiting (always enabled)
+	mempoolConfig.CompoundTxRateLimitEnabled = true
+	if cfg.MaxCompoundTxPerMinute > 0 {
+		mempoolConfig.MaxCompoundTxPerAddressPerMinute = cfg.MaxCompoundTxPerMinute
+	}
+	if cfg.CompoundTxRateLimitWindow > 0 {
+		mempoolConfig.CompoundTxRateLimitWindowMinutes = cfg.CompoundTxRateLimitWindow
+	}
+	if cfg.CompoundTxInputsThreshold > 0 {
+		mempoolConfig.CompoundTxMinInputsThreshold = cfg.CompoundTxInputsThreshold
+	}
+
+	// Configure wallet freezing (always enabled).
+	mempoolConfig.WalletFreezingEnabled = true
+	mempoolConfig.FrozenAddresses, err = mergedAndValidatedFrozenAddresses(
+		mempoolConfig.FrozenAddresses, cfg.FrozenAddresses, cfg.ActiveNetParams.Prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	domain, err := domain.New(&consensusConfig, mempoolConfig, db)
+	if err != nil {
+		return nil, err
+	}
+	bindDisqualifiedStreakRecovery(domain, cfg.ShutdownOnDisqualifiedStreak)
+	utxobaseline.Refresh(domain)
+
+	netAdapter, err := netadapter.NewNetAdapter(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	addressManager, err := addressmanager.New(addressmanager.NewConfig(cfg), db)
+	if err != nil {
+		return nil, err
+	}
+
+	var utxoIndex *utxoindex.UTXOIndex
+	if cfg.UTXOIndex {
+		utxoIndex, err = utxoindex.New(domain, db)
+		if err != nil {
+			return nil, err
+		}
+
+		log.Infof("UTXO index started")
+	}
+
+	connectionManager, err := connmanager.New(cfg, netAdapter, addressManager)
+	if err != nil {
+		return nil, err
+	}
+	protocolManager, err := protocol.NewManager(cfg, domain, netAdapter, addressManager, connectionManager)
+	if err != nil {
+		return nil, err
+	}
+	rpcManager := setupRPC(cfg, domain, netAdapter, protocolManager, connectionManager, addressManager, utxoIndex, domain.ConsensusEventsChannel(), interrupt)
+
+	// Create auto-updater if enabled
+	var updater *autoupdate.Updater
+	if bool(cfg.AutoUpdateEnabled) {
+		updaterConfig := &autoupdate.Config{
+			Enabled:          bool(cfg.AutoUpdateEnabled),
+			CheckInterval:    cfg.AutoUpdateCheckInterval,
+			GitHubOwner:      "HoosatNetwork",
+			GitHubRepo:       "HTND",
+			UpdateChannel:    cfg.AutoUpdateChannel,
+			AutoDownload:     bool(cfg.AutoUpdateDownload),
+			AutoInstall:      bool(cfg.AutoUpdateInstall),
+			NotifyOnly:       false,
+			AutoReportIssues: bool(cfg.AutoReportIssues),
+
+			ReleasePublicKey:       cfg.AutoUpdatePublicKey,
+			AllowUnverifiedInstall: bool(cfg.AutoUpdateAllowUnverified),
+		}
+		updater = autoupdate.NewUpdater(updaterConfig)
+		log.Infof("Auto-updater initialized (channel: %s, interval: %v, autoreport: %v)", updaterConfig.UpdateChannel, updaterConfig.CheckInterval, updaterConfig.AutoReportIssues)
+	}
+
+	return &ComponentManager{
+		cfg:               cfg,
+		protocolManager:   protocolManager,
+		rpcManager:        rpcManager,
+		connectionManager: connectionManager,
+		netAdapter:        netAdapter,
+		addressManager:    addressManager,
+		updater:           updater,
+	}, nil
+}
+
+func setupRPC(
+	cfg *config.Config,
+	domain domain.Domain,
+	netAdapter *netadapter.NetAdapter,
+	protocolManager *protocol.Manager,
+	connectionManager *connmanager.ConnectionManager,
+	addressManager *addressmanager.AddressManager,
+	utxoIndex *utxoindex.UTXOIndex,
+	consensusEventsChan chan externalapi.ConsensusEvent,
+	shutDownChan chan<- struct{},
+) *rpc.Manager {
+	rpcManager := rpc.NewManager(
+		cfg,
+		domain,
+		netAdapter,
+		protocolManager,
+		connectionManager,
+		addressManager,
+		utxoIndex,
+		consensusEventsChan,
+		shutDownChan,
+	)
+	protocolManager.SetOnNewBlockTemplateHandler(rpcManager.NotifyNewBlockTemplate)
+	protocolManager.SetOnPruningPointUTXOSetOverrideHandler(rpcManager.NotifyPruningPointUTXOSetOverride)
+
+	return rpcManager
+}
+
+// P2PNodeID returns the network ID associated with this ComponentManager
+func (a *ComponentManager) P2PNodeID() *id.ID {
+	return a.netAdapter.ID()
+}
+
+// AddressManager returns the AddressManager associated with this ComponentManager
+func (a *ComponentManager) AddressManager() *addressmanager.AddressManager {
+	return a.addressManager
+}
+
+// Updater returns the Updater associated with this ComponentManager, or nil if auto-update is disabled
+func (a *ComponentManager) Updater() *autoupdate.Updater {
+	return a.updater
+}

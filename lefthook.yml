@@ -1,0 +1,16 @@
+# lefthook configuration.
+#
+# This content used to live in letfhook.yml - a typo lefthook never reads, since it looks for
+# lefthook.yml/.yaml (or a .lefthook variant). Meanwhile this file held nothing but lefthook's
+# commented-out example template. So the pre-commit hook was configured, committed, and documented,
+# but had never actually run for anyone.
+#
+# .hooks/pre-commit runs gofmt and staticcheck over the staged packages. It is not a substitute for
+# build_and_test.sh, which is what CI gates on.
+#
+# Install with: lefthook install
+
+pre-commit:
+  commands:
+    custom-pre-commit:
+      run: .hooks/pre-commit

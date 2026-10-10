@@ -1,0 +1,400 @@
+package ruleerrors
+
+import (
+	"fmt"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+	"github.com/pkg/errors"
+)
+
+// These constants are used to identify a specific RuleError.
+var (
+
+	// DaaScoreNil indicates that the DAA Score is zero or negative.
+	DaaScoreNil = newRuleError("DaaScoreNil")
+
+	// PowScoresEmpty indicates that there are no hard fork DAA Scores defined.
+	PowScoresEmpty = newRuleError("PowScoresEmpty")
+
+	// ErrDuplicateBlock indicates a block with the same hash already
+	// exists.
+	ErrDuplicateBlock = newRuleError("ErrDuplicateBlock")
+
+	// ErrDisqualifiedOrInvalid indicates a block which is disqualified or invalid.
+	ErrDisqualifiedOrInvalid = newRuleError("ErrDisqualifiedOrInvalid")
+
+	// ErrBlockVersionTooOld indicates the block version is too old and is
+	// no longer accepted since the majority of the network has upgraded
+	// to a newer version.
+	ErrBlockVersionTooOld = newRuleError("ErrBlockVersionTooOld")
+
+	// ErrTimeTooOld indicates the time is either before the median time of
+	// the last several blocks per the DAG consensus rules.
+	ErrTimeTooOld = newRuleError("ErrTimeTooOld")
+
+	// ErrTimeTooMuchInTheFuture indicates that the block timestamp is too much in the future.
+	ErrTimeTooMuchInTheFuture = newRuleError("ErrTimeTooMuchInTheFuture")
+
+	// ErrNoParents indicates that the block is missing parents
+	ErrNoParents = newRuleError("ErrNoParents")
+
+	// ErrUnexpectedDifficulty indicates specified bits do not align with
+	// the expected value either because it doesn't match the calculated
+	// valued based on difficulty regarted rules.
+	ErrUnexpectedDifficulty = newRuleError("ErrUnexpectedDifficulty")
+
+	// ErrUnexpectedDAAScore indicates specified DAA score does not align with
+	// the expected value.
+	ErrUnexpectedDAAScore = newRuleError("ErrUnexpectedDAAScore")
+
+	// ErrUnexpectedBlueWork indicates specified blue work does not align with
+	// the expected value.
+	ErrUnexpectedBlueWork = newRuleError("ErrUnexpectedBlueWork")
+
+	// ErrUnexpectedBlueWork indicates specified blue work does not align with
+	// the expected value.
+	ErrUnexpectedBlueScore = newRuleError("ErrUnexpectedBlueScore")
+
+	// ErrUnexpectedFinalityPoint indicates specified finality point does not align with
+	// the expected value.
+	ErrUnexpectedFinalityPoint = newRuleError("ErrUnexpectedFinalityPoint")
+
+	// ErrUnexpectedCoinbaseBlueScore indicates specified blue score in the coinbase does not align with
+	// the expected value.
+	ErrUnexpectedCoinbaseBlueScore = newRuleError("ErrUnexpectedCoinbaseBlueScore")
+
+	// ErrUnexpectedHeaderBlueScore indicates specified blue score in the header does not align with
+	// the expected value.
+	ErrUnexpectedHeaderBlueScore = newRuleError("ErrUnexpectedHeaderBlueScore")
+
+	// ErrTargetTooHigh indicates specified bits do not align with
+	// the expected value either because it is above the valid
+	// range.
+	ErrTargetTooHigh = newRuleError("ErrTargetTooHigh")
+
+	// ErrUnexpectedDifficulty indicates specified bits do not align with
+	// the expected value either because it is negative.
+	ErrNegativeTarget = newRuleError("ErrNegativeTarget")
+
+	// ErrInvalidPoW indicates that the block proof-of-work is invalid.
+	ErrInvalidPoW = newRuleError("ErrInvalidPoW")
+
+	// ErrBadMerkleRoot indicates the calculated merkle root does not match
+	// the expected value.
+	ErrBadMerkleRoot = newRuleError("ErrBadMerkleRoot")
+
+	// ErrBadUTXOCommitment indicates the calculated UTXO commitment does not match
+	// the expected value.
+	ErrBadUTXOCommitment = newRuleError("ErrBadUTXOCommitment")
+
+	// ErrFinalityPointTimeTooOld indicates a block has a timestamp before the
+	// last finality point.
+	ErrFinalityPointTimeTooOld = newRuleError("ErrFinalityPointTimeTooOld")
+
+	// ErrNoTransactions indicates the block does not have a least one
+	// transaction. A valid block must have at least the coinbase
+	// transaction.
+	ErrNoTransactions = newRuleError("ErrNoTransactions")
+
+	// ErrNoTxInputs indicates a transaction does not have any inputs. A
+	// valid transaction must have at least one input.
+	ErrNoTxInputs = newRuleError("ErrNoTxInputs")
+
+	// ErrBadTxOutValue indicates an output value for a transaction is
+	// invalid in some way such as being out of range.
+	ErrBadTxOutValue  = newRuleError("ErrBadTxOutValue")
+	ErrTxOutValueZero = newRuleError("ErrTxOutValueZero")
+
+	// ErrDuplicateTxInputs indicates a transaction references the same
+	// input more than once.
+	ErrDuplicateTxInputs = newRuleError("ErrDuplicateTxInputs")
+
+	// ErrDoubleSpendInSameBlock indicates a transaction
+	// that spends an output that was already spent by another
+	// transaction in the same block.
+	ErrDoubleSpendInSameBlock = newRuleError("ErrDoubleSpendInSameBlock")
+
+	// ErrUnfinalizedTx indicates a transaction has not been finalized.
+	// A valid block may only contain finalized transactions.
+	ErrUnfinalizedTx = newRuleError("ErrUnfinalizedTx")
+
+	// ErrDuplicateTx indicates a block contains an identical transaction
+	// (or at least two transactions which hash to the same value). A
+	// valid block may only contain unique transactions.
+	ErrDuplicateTx = newRuleError("ErrDuplicateTx")
+
+	// ErrImmatureSpend indicates a transaction is attempting to spend a
+	// coinbase that has not yet reached the required maturity.
+	ErrImmatureSpend = newRuleError("ErrImmatureSpend")
+
+	// ErrSpendTooHigh indicates a transaction is attempting to spend more
+	// value than the sum of all of its inputs.
+	ErrSpendTooHigh = newRuleError("ErrSpendTooHigh")
+
+	// ErrFirstTxNotCoinbase indicates the first transaction in a block
+	// is not a coinbase transaction.
+	ErrFirstTxNotCoinbase = newRuleError("ErrFirstTxNotCoinbase")
+
+	// ErrDevFeeNotIncluded indicates that the transactions do not
+	// include dev fee.
+	ErrDevFeeNotIncluded = newRuleError("ErrDevFeeNotIncluded")
+
+	// ErrMultipleCoinbases indicates a block contains more than one
+	// coinbase transaction.
+	ErrMultipleCoinbases = newRuleError("ErrMultipleCoinbases")
+
+	// ErrBadCoinbasePayloadLen indicates the length of the payload
+	// for a coinbase transaction is too high.
+	ErrBadCoinbasePayloadLen = newRuleError("ErrBadCoinbasePayloadLen")
+
+	// ErrBadCoinbaseTransaction indicates that the block's coinbase transaction is not build as expected
+	ErrBadCoinbaseTransaction = newRuleError("ErrBadCoinbaseTransaction")
+
+	// ErrScriptMalformed indicates a transaction script is malformed in
+	// some way. For example, it might be longer than the maximum allowed
+	// length or fail to parse.
+	ErrScriptMalformed = newRuleError("ErrScriptMalformed")
+
+	// ErrScriptValidation indicates the result of executing transaction
+	// script failed. The error covers any failure when executing scripts
+	// such signature verification failures and execution past the end of
+	// the stack.
+	ErrScriptValidation = newRuleError("ErrScriptValidation")
+
+	// ErrInvalidAncestorBlock indicates that an ancestor of this block has
+	// already failed validation.
+	ErrInvalidAncestorBlock = newRuleError("ErrInvalidAncestorBlock")
+
+	// ErrTransactionsNotSorted indicates that transactions in block are not
+	// sorted by subnetwork
+	ErrTransactionsNotSorted = newRuleError("ErrTransactionsNotSorted")
+
+	// ErrInvalidGas transaction wants to use more GAS than allowed
+	// by subnetwork
+	ErrInvalidGas = newRuleError("ErrInvalidGas")
+
+	// ErrInvalidPayload transaction includes a payload in a data subnetwork that doesn't allow
+	// a Payload
+	ErrInvalidPayload = newRuleError("ErrInvalidPayload")
+
+	// ErrTooLargePayload transaction includes a payload in a data subnetwork which is too large payload.
+	ErrTooLargePayload = newRuleError("ErrTooLargePayload")
+
+	// ErrWrongSigOpCount transaction input specifies an incorrect SigOpCount
+	ErrWrongSigOpCount = newRuleError("ErrWrongSigOpCount")
+
+	// ErrSubnetwork indicates that a block doesn't adhere to the subnetwork
+	// registry rules
+	ErrSubnetworkRegistry = newRuleError("ErrSubnetworkRegistry")
+
+	// ErrInvalidParentsRelation indicates that one of the parents of a block
+	// is also an ancestor of another parent
+	ErrInvalidParentsRelation = newRuleError("ErrInvalidParentsRelation")
+
+	// ErrInvalidBlockParent indicates that a block has a parent with an invalid status
+	// (e.g., StatusInvalid or StatusDisqualifiedFromChain)
+	ErrInvalidBlockParent = newRuleError("ErrInvalidBlockParent")
+
+	// ErrTooManyParents indicates that a block points to more then `MaxNumParentBlocks` parents
+	ErrTooManyParents = newRuleError("ErrTooManyParents")
+
+	// ErrViolatingBoundedMergeDepth indicates that a block is violating finality from
+	// its own point of view
+	ErrViolatingBoundedMergeDepth = newRuleError("ErrViolatingBoundedMergeDepth")
+
+	// ErrViolatingMergeLimit indicates that a block merges more than mergeLimit blocks
+	ErrViolatingMergeLimit = newRuleError("ErrViolatingMergeLimit")
+
+	// ErrChainedTransactions indicates that a block contains a transaction that spends an output of a transaction
+	// In the same block
+	ErrChainedTransactions = newRuleError("ErrChainedTransactions")
+
+	// ErrBlockMassTooHigh indicates the mass of a block exceeds the maximum
+	// allowed limits.
+	ErrBlockMassTooHigh = newRuleError("ErrBlockMassTooHigh")
+
+	ErrKnownInvalid = newRuleError("ErrKnownInvalid")
+
+	ErrSubnetworksDisabled    = newRuleError("ErrSubnetworksDisabled")
+	ErrBadPruningPointUTXOSet = newRuleError("ErrBadPruningPointUTXOSet")
+
+	ErrMalformedUTXO = newRuleError("ErrMalformedUTXO")
+
+	// ErrDuplicateUTXOEntry indicates an attempt to add a UTXO entry for an outpoint
+	// that already exists in the UTXO diff with a different entry. This can happen
+	// during state restoration when processing merge sets.
+	ErrDuplicateUTXOEntry = newRuleError("ErrDuplicateUTXOEntry")
+
+	ErrWrongPruningPointHash = newRuleError("ErrWrongPruningPointHash")
+
+	// ErrPruningPointViolation indicates that the pruning point isn't in the block past.
+	ErrPruningPointViolation = newRuleError("ErrPruningPointViolation")
+
+	ErrUnexpectedParents = newRuleError("ErrUnexpectedParents")
+
+	ErrUnexpectedPruningPoint = newRuleError("ErrUnexpectedPruningPoint")
+
+	ErrInvalidPruningPointsChain = newRuleError("ErrInvalidPruningPointsChain")
+
+	ErrSuggestedPruningViolatesFinality = newRuleError("ErrSuggestedPruningViolatesFinality")
+
+	// ErrBlockVersionIsUnknown indicates that the block version is unknown.
+	ErrBlockVersionIsUnknown = newRuleError("ErrBlockVersionIsUnknown")
+
+	// ErrTransactionVersionIsUnknown indicates that the transaction version is unknown.
+	ErrTransactionVersionIsUnknown = newRuleError("ErrTransactionVersionIsUnknown")
+
+	// ErrPrunedBlock indicates that the block currently being validated had already been pruned.
+	ErrPrunedBlock = newRuleError("ErrPrunedBlock")
+
+	ErrGetVirtualUTXOsWrongVirtualParents = newRuleError("ErrGetVirtualUTXOsWrongVirtualParents")
+
+	ErrVirtualGenesisParent = newRuleError("ErrVirtualGenesisParent")
+
+	ErrGenesisOnInitializedConsensus = newRuleError("ErrGenesisOnInitializedConsensus")
+
+	ErrPruningPointSelectedChildDisqualifiedFromChain = newRuleError("ErrPruningPointSelectedChildDisqualifiedFromChain")
+
+	// ErrUnexpectedFinalityPoint indicates a block header pruning point does not align with
+	// the expected value.
+	ErrUnexpectedHeaderPruningPoint = newRuleError("ErrUnexpectedHeaderPruningPoint")
+
+	ErrPruningProofHeaderWithNoKnownParents           = newRuleError("ErrPruningProofHeaderWithNoKnownParents")
+	ErrPruningProofMissingBlockLevels                 = newRuleError("ErrPruningProofMissingBlockLevels")
+	ErrPruningProofWrongBlockLevel                    = newRuleError("ErrPruningProofWrongBlockLevel")
+	ErrPruningProofSelectedTipNotParentOfPruningPoint = newRuleError("ErrPruningProofSelectedTipNotParentOfPruningPoint")
+	ErrPruningProofSelectedTipIsNotThePruningPoint    = newRuleError("ErrPruningProofSelectedTipIsNotThePruningPoint")
+	ErrPruningProofInsufficientBlueWork               = newRuleError("ErrPruningProofInsufficientBlueWork")
+	ErrPruningProofMissingBlockAtDepthMFromNextLevel  = newRuleError("ErrPruningProofMissingBlockAtDepthMFromNextLevel")
+	ErrPruningProofMissesBlocksBelowPruningPoint      = newRuleError("ErrPruningProofMissesBlocksBelowPruningPoint")
+	ErrPruningProofEmpty                              = newRuleError("ErrPruningProofEmpty")
+	ErrWrongCoinbaseSubsidy                           = newRuleError("ErrWrongCoinbaseSubsidy")
+	ErrWrongBlockVersion                              = newRuleError("ErrWrongBlockVersion")
+	ErrCoinbaseWithInputs                             = newRuleError("ErrCoinbaseWithInputs")
+	ErrCoinbaseTooManyOutputs                         = newRuleError("ErrCoinbaseTooManyOutputs")
+	ErrCoinbaseTooLongScriptPublicKey                 = newRuleError("ErrCoinbaseTooLongScriptPublicKey")
+)
+
+// RuleError identifies a rule violation. It is used to indicate that
+// processing of a block or transaction failed due to one of the many validation
+// rules. The caller can use type assertions to determine if a failure was
+// specifically due to a rule violation.
+type RuleError struct {
+	message string
+	inner   error
+}
+
+// Error satisfies the error interface and prints human-readable errors.
+func (e RuleError) Error() string {
+	if e.inner != nil {
+		return e.message + ": " + e.inner.Error()
+	}
+	return e.message
+}
+
+// Unwrap satisfies the errors.Unwrap interface
+func (e RuleError) Unwrap() error {
+	return e.inner
+}
+
+// Cause satisfies the github.com/pkg/errors.Cause interface
+func (e RuleError) Cause() error {
+	return e.inner
+}
+
+func newRuleError(message string) RuleError {
+	return RuleError{message: message, inner: nil}
+}
+
+// ErrMissingTxOut indicates a transaction output referenced by an input
+// either does not exist or has already been spent.
+//
+// Those are not the same finding and must not be treated as one. An outpoint already spent in the
+// view being validated against is a genuine double spend - a real rule violation, and rejecting it
+// is the point of the check. An outpoint simply absent from this node's UTXO set says nothing about
+// the transaction: it says this node does not hold a coin the network does, and the transaction may
+// be perfectly valid. SpentOutpoints separates the first kind so a node can never tolerate a double
+// spend on the grounds that its own UTXO set is incomplete.
+type ErrMissingTxOut struct {
+	// MissingOutpoints is every input that could not be resolved, of either kind.
+	MissingOutpoints []*externalapi.DomainOutpoint
+
+	// SpentOutpoints is the subset already spent in the view being validated against - the genuine
+	// double spends. Empty means every unresolved input was merely absent from this node's set.
+	SpentOutpoints []*externalapi.DomainOutpoint
+}
+
+// HasDoubleSpend reports whether any unresolved input was already spent, rather than merely absent
+// from this node's UTXO set.
+func (e ErrMissingTxOut) HasDoubleSpend() bool {
+	return len(e.SpentOutpoints) > 0
+}
+
+func (e ErrMissingTxOut) Error() string {
+	if len(e.SpentOutpoints) > 0 {
+		return fmt.Sprintf("missing the following outpoint: %v (of which already spent, a double "+
+			"spend: %v)", e.MissingOutpoints, e.SpentOutpoints)
+	}
+	return fmt.Sprintf("missing the following outpoint: %v", e.MissingOutpoints)
+}
+
+// NewErrMissingTxOut Creates a new ErrMissingTxOut error wrapped in a RuleError
+func NewErrMissingTxOut(missingOutpoints []*externalapi.DomainOutpoint) error {
+	return NewErrMissingOrSpentTxOut(missingOutpoints, nil)
+}
+
+// NewErrMissingOrSpentTxOut creates an ErrMissingTxOut that distinguishes inputs already spent in
+// the view being validated against - genuine double spends - from inputs merely absent from this
+// node's UTXO set. spentOutpoints must also appear in missingOutpoints, which stays the full list so
+// that every existing consumer sees exactly what it saw before.
+func NewErrMissingOrSpentTxOut(missingOutpoints, spentOutpoints []*externalapi.DomainOutpoint) error {
+	return errors.WithStack(RuleError{
+		message: "ErrMissingTxOut",
+		inner:   ErrMissingTxOut{MissingOutpoints: missingOutpoints, SpentOutpoints: spentOutpoints},
+	})
+}
+
+// ErrMissingParents indicates a block points to unknown parent(s).
+type ErrMissingParents struct {
+	MissingParentHashes []*externalapi.DomainHash
+}
+
+func (e ErrMissingParents) Error() string {
+	return fmt.Sprintf("missing the following parent hashes: %v\n", e.MissingParentHashes)
+}
+
+// NewErrMissingParents creates a new ErrMissingParents error wrapped in a RuleError
+func NewErrMissingParents(missingParentHashes []*externalapi.DomainHash) error {
+	return errors.WithStack(RuleError{
+		message: "ErrMissingParents",
+		inner:   ErrMissingParents{missingParentHashes},
+	})
+}
+
+// InvalidTransaction is a struct containing an invalid transaction, and the error explaining why it's invalid.
+type InvalidTransaction struct {
+	Transaction *externalapi.DomainTransaction
+	Error       *RuleError
+}
+
+func (invalid InvalidTransaction) String() string {
+	return fmt.Sprintf("(%v: %s)", consensushashing.TransactionID(invalid.Transaction), invalid.Error)
+}
+
+// ErrInvalidTransactionsInNewBlock indicates that some transactions in a new block are invalid
+type ErrInvalidTransactionsInNewBlock struct {
+	InvalidTransactions []InvalidTransaction
+}
+
+func (e ErrInvalidTransactionsInNewBlock) Error() string {
+	return fmt.Sprint(e.InvalidTransactions)
+}
+
+// NewErrInvalidTransactionsInNewBlock Creates a new ErrInvalidTransactionsInNewBlock error wrapped in a RuleError
+func NewErrInvalidTransactionsInNewBlock(invalidTransactions []InvalidTransaction) error {
+	return errors.WithStack(RuleError{
+		message: "ErrInvalidTransactionsInNewBlock",
+		inner:   ErrInvalidTransactionsInNewBlock{invalidTransactions},
+	})
+}

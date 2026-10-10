@@ -1,0 +1,859 @@
+package consensusstatemanager
+
+import (
+	"bytes"
+	"sort"
+	"sync"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/transactionhelper"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/merkle"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/ruleerrors"
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/hardforks"
+	"github.com/pkg/errors"
+)
+
+// verifyUTXO runs every UTXO check a block has to pass. survey may be nil; when it is not, each
+// check is run even after an earlier one has failed and each failure is recorded, so that the
+// resulting survey record describes the whole block instead of only its first symptom. The error
+// returned to the caller is still the first non-tolerated one either way, so validation behaves
+// identically whether or not the survey is on.
+func (csm *consensusStateManager) verifyUTXO(stagingArea *model.StagingArea, block *externalapi.DomainBlock,
+	blockHash *externalapi.DomainHash, pastUTXODiff externalapi.UTXODiff, acceptanceData externalapi.AcceptanceData,
+	multiset model.Multiset, survey *blockSurvey,
+) error {
+	log.Tracef("verifyUTXO start for block %s", blockHash)
+	defer log.Tracef("verifyUTXO end for block %s", blockHash)
+
+	// When the chain is built on an incomplete imported pruning-point UTXO set
+	// (blockInheritsKnownUTXOCommitmentOffset), the per-step UTXO-consistency checks below can fail
+	// through no fault of the block - this node's UTXO data is simply missing pieces, so the
+	// multiset is offset, acceptance can differ, inputs go missing. There is nothing to "harden"
+	// against: the chain data itself is broken and every node has the same gap. In that regime any
+	// RuleError from these checks is downgraded to a logged issue so virtual resolution can advance.
+	// The block is then NOT fully UTXO-validated - the node is trusting the network's acceptance of
+	// it - and this only ever engages on a chain already known to be offset from the true UTXO set.
+	tolerate := false
+
+	// HTN-002/HTN-004, gated at hardforks.StrictUTXOCommitmentVersion: from that block version
+	// onward the toleration above stops applying, and these four checks fail closed as they were
+	// always meant to.
+	//
+	// The gate is unscheduled, so this is inert for every block version any network can produce
+	// today - see the hardforks package. It must stay that way until a coordinated rebaseline:
+	// essentially every mainnet node currently runs on an offset baseline, so a node that stopped
+	// tolerating would disqualify the live chain and fall off the network alone.
+	//
+	// utxoCommitmentIsStrictFor derives the version from the selected parent's DAA score, never from
+	// the block's own header version field, which is peer-supplied: this gate adds strictness, so
+	// keying it on a field the miner chooses would let any miner opt out by claiming an older
+	// version.
+	if tolerate {
+		strict, err := csm.utxoCommitmentIsStrictFor(stagingArea, blockHash)
+		if err != nil {
+			return err
+		}
+		if strict {
+			tolerate = false
+		}
+	}
+
+	// firstError is what the caller sees: the first failure that was not tolerated, exactly as
+	// before. stop reports whether verification should abandon the remaining checks - it does unless
+	// the survey is on, in which case the rest are run purely to fill in the record.
+	// Tolerating the inherited offset must not mean tolerating everything. A block whose own
+	// acceptance data and UTXO diff disagree has created or destroyed something its own record does
+	// not account for, and no baseline offset can explain that - waving it through lets new corruption
+	// arrive on top of the old under the same log line.
+	//
+	// Answered on the first failure and then remembered, which is what "only when something has
+	// actually failed and toleration is on the table" was always meant to mean. It used to be
+	// computed as soon as tolerate was true - so on a node with an offset baseline, which is the only
+	// kind this engages on, every block that passed every check still paid for a full walk of its
+	// merge set's acceptance data to answer a question no failure had asked. stop() below runs
+	// sequentially, so this needs no synchronisation of its own.
+	offsetVerdictKnown, carriesOffsetOnly := false, true
+	blockCarriesOffsetOnly := func() bool {
+		if offsetVerdictKnown {
+			return carriesOffsetOnly
+		}
+		offsetVerdictKnown = true
+		var arithmeticProblem string
+		carriesOffsetOnly, arithmeticProblem = blockOnlyCarriesTheInheritedOffset(
+			acceptanceData, pastUTXODiff, block.Header.DAAScore(),
+			func(outpoint *externalapi.DomainOutpoint) (externalapi.UTXOEntry, bool) {
+				return csm.virtualUTXOEntry(stagingArea, outpoint)
+			})
+		if !carriesOffsetOnly {
+			log.Warnf("Block %s: NOT tolerating its failures despite this node's offset baseline - %s. "+
+				"An incomplete pruning-point UTXO set explains a commitment that cannot be reproduced; "+
+				"it does not explain a block whose own acceptance data and UTXO diff disagree.",
+				blockHash, arithmeticProblem)
+		}
+		return carriesOffsetOnly
+	}
+
+	var firstError error
+	stop := func(step string, err error) bool {
+		if err == nil {
+			return false
+		}
+		survey.noteFailure(step, err)
+		if tolerate && errors.As(err, &ruleerrors.RuleError{}) && blockCarriesOffsetOnly() {
+			csm.logToleratedIssue(step, blockHash, err)
+			return false
+		}
+		if firstError == nil {
+			firstError = err
+		}
+		// The survey runs the remaining checks so that one record describes the whole block. That is
+		// only worth doing for consensus failures: a non-RuleError is a database or programming fault,
+		// not a finding, and continuing past one can only produce noise on top of it.
+		return !survey.active() || !errors.As(err, &ruleerrors.RuleError{})
+	}
+
+	log.Debugf("Validating UTXO commitment for block %s", blockHash)
+	if stop("utxo-commitment", csm.validateUTXOCommitment(stagingArea, block, blockHash, multiset)) {
+		return firstError
+	}
+	log.Debugf("UTXO commitment validation passed for block %s", blockHash)
+
+	log.Debugf("Validating acceptedIDMerkleRoot for block %s", blockHash)
+	if stop("accepted-id-merkle-root", csm.validateAcceptedIDMerkleRoot(block, blockHash, acceptanceData)) {
+		return firstError
+	}
+	log.Debugf("AcceptedIDMerkleRoot validation passed for block %s", blockHash)
+
+	coinbaseTransaction := block.Transactions[0]
+	if stop("coinbase-transaction",
+		csm.validateCoinbaseTransaction(stagingArea, block, blockHash, coinbaseTransaction, acceptanceData)) {
+		return firstError
+	}
+	log.Debugf("Coinbase transaction validation passed for block %s", blockHash)
+
+	log.Debugf("Validating transactions against past UTXO for block %s", blockHash)
+	if stop("block-transactions-vs-past-utxo",
+		csm.validateBlockTransactionsAgainstPastUTXO(stagingArea, block, pastUTXODiff, acceptanceData, survey)) {
+		return firstError
+	}
+	log.Debugf("Block transaction against past UTXO passed for %s", blockHash)
+	log.Tracef("Transactions against past UTXO validation passed for block %s", blockHash)
+
+	return firstError
+}
+
+// logToleratedIssue records that an inherited-offset toleration point fired: the first time for a
+// given step label it logs at warn (so operators see, once, that the node is running permissively
+// on broken chain data), and every subsequent time at debug (so a 200k-block re-sync does not emit
+// a warn line per block).
+func (csm *consensusStateManager) logToleratedIssue(step string, blockHash *externalapi.DomainHash, err error) {
+	if _, alreadyLogged := csm.toleratedIssuesLogged.LoadOrStore(step, struct{}{}); alreadyLogged {
+		log.Debugf("Block %s: tolerated %s issue on inherited pruning-point offset: %s", blockHash, step, err)
+		return
+	}
+	log.Warnf("Block %s: %s check failed and is being TOLERATED (%s). The chain is built on an incomplete "+
+		"imported pruning-point UTXO set, so this cannot be verified locally and the block is not being "+
+		"fully validated. Further %s tolerations are logged at debug level.", blockHash, step, err, step)
+}
+
+// validateBlockTransactionsAgainstPastUTXO validates every non-coinbase transaction in the block
+// against the block's past UTXO set. survey may be nil; when it is not, every transaction is
+// checked even after one of them has already failed, and every missing outpoint is recorded. That
+// matters because a block whose inputs are missing usually has more than one of them, and the
+// existing behaviour - abandon the remaining transactions the moment one fails - would leave the
+// survey with a single outpoint out of however many the block actually could not resolve. The error
+// returned is still a missing-input RuleError either way.
+func (csm *consensusStateManager) validateBlockTransactionsAgainstPastUTXO(stagingArea *model.StagingArea,
+	block *externalapi.DomainBlock, pastUTXODiff externalapi.UTXODiff,
+	acceptanceData externalapi.AcceptanceData, survey *blockSurvey,
+) error {
+	blockHash := consensushashing.BlockHash(block)
+	log.Tracef("validateBlockTransactionsAgainstPastUTXO start for block %s", blockHash)
+	defer log.Tracef("validateBlockTransactionsAgainstPastUTXO end for block %s", blockHash)
+
+	selectedParentMedianTime, err := csm.pastMedianTimeManager.PastMedianTime(stagingArea, blockHash)
+	if err != nil {
+		return err
+	}
+	log.Tracef("The past median time of %s is %d", blockHash, selectedParentMedianTime)
+
+	// When the chain is built on an incomplete imported pruning-point UTXO set (see
+	// blockInheritsKnownUTXOCommitmentOffset), some real, spendable outputs are simply absent from
+	// this node's UTXO set, and any block-body transaction that spends one of them fails here with
+	// ErrMissingTxOut through no fault of its own. In that regime the missing-input transaction is
+	// skipped (its inputs are not verified and are left in place) so virtual resolution can advance.
+	// This means the block body is NOT being fully validated - the node is trusting the network's
+	// acceptance of it - and only ever happens on a chain already known to be offset from the true
+	// UTXO set.
+	//
+	// It deliberately does NOT consult ErrMissingTxOut.HasDoubleSpend here, though it used to.
+	//
+	// That flag means "the outpoint was in the diff's toRemove", which is a statement about double
+	// spending only when the diff is the accumulated one being built during acceptance - there
+	// toRemove records spends this very pass made. The diff handed to THIS function is different: it
+	// is the block's past relative to virtual, where toRemove means "virtual holds this coin and this
+	// block's past does not". That covers coins created after the block as much as coins spent before
+	// it, so reading it as a double spend convicts blocks that never spent anything twice.
+	//
+	// The cost was not theoretical. A node syncing mainnet refused 150 blocks this way, started block
+	// body sync eight times, and accepted zero blocks - IBD reached 99% of headers and then made no
+	// further progress at all, because every attempt met a block it refused on this evidence.
+	//
+	// A block whose own records genuinely disagree with each other is still refused: that is what
+	// blockOnlyCarriesTheInheritedOffset above decides, by comparing the block's acceptance data
+	// against its own UTXO diff, and it needs no guess about what a toRemove entry means.
+	tolerateMissingTxOut := csm.blockInheritsKnownUTXOCommitmentOffset(stagingArea, blockHash)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var stagingMu sync.Mutex
+	var firstErr error
+	done := make(chan struct{}) // Signal to stop other goroutines on first error
+
+	// Same verdict as verifyUTXO's: a block whose own arithmetic is broken gets no leniency from a
+	// baseline that only explains commitments it cannot reproduce.
+	//
+	// Reached only once a transaction has actually failed with a missing input, and computed once
+	// per block when it is. Running it up front meant every clean block on an offset node walked its
+	// whole merge set here as well as in verifyUTXO - two full scans per block, neither of which any
+	// failure had asked for.
+	var offsetVerdictOnce sync.Once
+	carriesOffsetOnly := true
+	tolerable := func(err error) bool {
+		if !tolerateMissingTxOut {
+			return false
+		}
+		var missingTxOut ruleerrors.ErrMissingTxOut
+		if !errors.As(err, &missingTxOut) {
+			return false
+		}
+		offsetVerdictOnce.Do(func() {
+			// Unlike verifyUTXO's, this can be reached from any of the per-transaction goroutines
+			// below, and the virtual lookup it passes reads the consensus state store - so it takes
+			// the same lock those goroutines use for store access. Callers reach here having released
+			// it, so there is nothing to deadlock against.
+			stagingMu.Lock()
+			defer stagingMu.Unlock()
+			carriesOffsetOnly, _ = blockOnlyCarriesTheInheritedOffset(
+				acceptanceData, pastUTXODiff, block.Header.DAAScore(),
+				func(outpoint *externalapi.DomainOutpoint) (externalapi.UTXOEntry, bool) {
+					return csm.virtualUTXOEntry(stagingArea, outpoint)
+				})
+		})
+		return carriesOffsetOnly
+	}
+
+	for i, transaction := range block.Transactions {
+		if i == transactionhelper.CoinbaseTransactionIndex {
+			log.Tracef("Skipping transaction %s because it is the coinbase", consensushashing.TransactionID(transaction))
+			continue
+		}
+
+		wg.Add(1)
+		go func(tx *externalapi.DomainTransaction) {
+			defer wg.Done()
+
+			select {
+			case <-done:
+				if !survey.active() {
+					return // Early exit if another goroutine found an error
+				}
+			default:
+			}
+
+			transactionID := consensushashing.TransactionID(tx)
+			log.Tracef("Validating transaction %s in block %s against the block's past UTXO", transactionID, blockHash)
+
+			// Populate UTXO entries
+			stagingMu.Lock()
+			err := csm.populateTransactionWithUTXOEntriesFromVirtualOrDiff(stagingArea, tx, pastUTXODiff)
+			stagingMu.Unlock()
+			if err != nil {
+				isMissingTxOut := errors.As(err, &ruleerrors.ErrMissingTxOut{})
+				if isMissingTxOut {
+					// Recorded here rather than in verifyUTXO's stop(), because a tolerated
+					// missing input never reaches it: this function returns nil in that case.
+					survey.noteFailure("block-transactions-vs-past-utxo", err)
+					survey.noteMissingOutpointsFromError(transactionID.String(), err)
+				}
+				if isMissingTxOut && tolerable(err) {
+					csm.logToleratedIssue("block-transaction-missing-input", blockHash,
+						errors.Wrapf(err, "transaction %s skipped", transactionID))
+					return
+				}
+				// Every other failure is recorded, not only missing inputs. A database error here used to
+				// return without setting firstErr: the transaction's inputs went unvalidated, the block was
+				// stored as UTXO-valid, and a transient local fault became a durable status difference.
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					close(done) // Signal others to stop
+				}
+				mu.Unlock()
+				return
+			}
+
+			// Validate transaction
+			err = csm.transactionValidator.ValidateTransactionInContextAndPopulateFee(
+				stagingArea, tx, blockHash, block.Header.DAAScore())
+			if err != nil {
+				isMissingTxOut := errors.As(err, &ruleerrors.ErrMissingTxOut{})
+				if isMissingTxOut {
+					survey.noteFailure("block-transactions-vs-past-utxo", err)
+					survey.noteMissingOutpointsFromError(transactionID.String(), err)
+				}
+				if isMissingTxOut && tolerable(err) {
+					csm.logToleratedIssue("block-transaction-missing-input", blockHash,
+						errors.Wrapf(err, "transaction %s skipped", transactionID))
+					return
+				}
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					close(done)
+				}
+				mu.Unlock()
+				return
+			}
+
+			log.Tracef("Validation against the block's past UTXO passed for transaction %s in block %s", transactionID, blockHash)
+		}(transaction)
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
+func (csm *consensusStateManager) validateAcceptedIDMerkleRoot(block *externalapi.DomainBlock,
+	blockHash *externalapi.DomainHash, acceptanceData externalapi.AcceptanceData,
+) error {
+	log.Tracef("validateAcceptedIDMerkleRoot start for block %s", blockHash)
+	defer log.Tracef("validateAcceptedIDMerkleRoot end for block %s", blockHash)
+
+	calculatedAcceptedIDMerkleRoot := calculateAcceptedIDMerkleRoot(acceptanceData, block.Header.Version())
+	if !block.Header.AcceptedIDMerkleRoot().Equal(calculatedAcceptedIDMerkleRoot) {
+		return errors.Wrapf(ruleerrors.ErrBadMerkleRoot, "block %s accepted ID merkle root is invalid - block "+
+			"header indicates %s, but calculated value is %s",
+			blockHash, block.Header.UTXOCommitment(), calculatedAcceptedIDMerkleRoot)
+	}
+
+	return nil
+}
+
+func (csm *consensusStateManager) validateUTXOCommitment(stagingArea *model.StagingArea,
+	block *externalapi.DomainBlock, blockHash *externalapi.DomainHash, multiset model.Multiset,
+) error {
+	log.Tracef("validateUTXOCommitment start for block %s", blockHash)
+	defer log.Tracef("validateUTXOCommitment end for block %s", blockHash)
+
+	if blockHash.Equal(csm.genesisHash) {
+		return nil
+	}
+
+	calculatedCommitment := multiset.Hash()
+	expectedCommitment := block.Header.UTXOCommitment()
+
+	if !calculatedCommitment.Equal(expectedCommitment) {
+		// When the chain is built on an incomplete imported pruning-point UTXO set (a peer's
+		// snapshotted set missing diffs from blocks disqualified upstream - see
+		// verifyAndRepairImportedPruningPointUTXOSet), every block resolved forward inherits the exact
+		// same fixed multiset offset, because MuHash is homomorphic. Disqualifying each of them for it
+		// leaves virtual resolution permanently stuck right above the pruning point. Detect that
+		// situation from the block's own selected parent - if the parent's stored multiset already
+		// disagrees with the parent's header commitment, or the parent IS the pruning point itself
+		// (see blockInheritsKnownUTXOCommitmentOffset, HTN-208), this block just carries the inherited
+		// offset, not fresh corruption - and tolerate it: stage the calculated multiset and continue.
+		// Fully self-scoping: as soon as the chain reaches a block whose selected parent is consistent
+		// (e.g. built on a clean pruning point), this returns false and strict enforcement resumes.
+		//
+		// The toleration itself lives in verifyUTXO, which applies the same predicate to any RuleError
+		// from any of its checks and logs it through the same logToleratedIssue("utxo-commitment").
+		// This branch therefore only skips the verbose dump below - which would otherwise fire once
+		// per block for an entire offset chain - and still RETURNS the error. Returning nil here
+		// instead, as it used to, made the toleration invisible above this frame: the failure never
+		// reached verifyUTXO, so the survey could not count it, and on an offset chain those are the
+		// failures there are thousands of.
+		if csm.blockInheritsKnownUTXOCommitmentOffset(stagingArea, blockHash) {
+			csm.confirmBaselineOffsetIfBoundaryBlock(stagingArea, blockHash)
+			return errors.Wrapf(ruleerrors.ErrBadUTXOCommitment, "block %s UTXO commitment is invalid - "+
+				"block header indicates %s, but calculated value is %s (inherited pruning-point offset)",
+				blockHash, expectedCommitment, calculatedCommitment)
+		}
+
+		// --- DEBUG LOGGING START ---
+		log.Debugf("[UTXO-DEBUG] Block Hash: %s", blockHash)
+		ghostdagData, err := csm.ghostdagDataStore.Get(csm.databaseContext, stagingArea, blockHash, false)
+		if err != nil {
+			log.Debugf("[UTXO-DEBUG] failed to fetch GhostDAGDAta")
+		} else {
+			log.Debugf("[UTXO-DEBUG] Selected Parent: %s", ghostdagData.SelectedParent())
+			log.Debugf("[UTXO-DEBUG] Blue Score: %d", ghostdagData.BlueScore())
+			log.Debugf("[UTXO-DEBUG] Blue Work: %x", ghostdagData.BlueWork())
+			log.Debugf("[UTXO-DEBUG] MergeSetBlues Count: %d", len(ghostdagData.MergeSetBlues()))
+			for i, blue := range ghostdagData.MergeSetBlues() {
+				log.Debugf("[UTXO-DEBUG] Blue[%d]: %s", i, blue)
+			}
+		}
+
+		log.Debugf("[UTXO-DEBUG] Header Expected UTXO Commitment: %s", expectedCommitment)
+		log.Debugf("[UTXO-DEBUG] Validation Calculated UTXO Commitment: %s", calculatedCommitment)
+		// --- DEBUG LOGGING END ---
+
+		return errors.Wrapf(ruleerrors.ErrBadUTXOCommitment, "block %s UTXO commitment is invalid - block "+
+			"header indicates %s, but calculated value is %s", blockHash, block.Header.UTXOCommitment(), calculatedCommitment)
+	}
+
+	return nil
+}
+
+// blockInheritsKnownUTXOCommitmentOffset reports whether blockHash sits on a chain whose UTXO
+// multiset is already offset from what the block headers commit to - the signature of a chain built
+// on an incomplete pruning-point UTXO set (see verifyAndRepairImportedPruningPointUTXOSet). Because
+// MuHash is homomorphic, that fixed offset propagates verbatim to every descendant, so blockHash's
+// own commitment mismatch is that same inherited offset, not fresh corruption.
+//
+// Three independent signals, any is sufficient:
+//
+//  1. The current pruning point's own stored multiset does not hash to its header's UTXOCommitment.
+//     This is the network-wide "we are on the offset baseline" condition and is always available
+//     (the pruning point's multiset is always committed), so it also covers live block processing
+//     where a just-accepted selected parent may still be UTXOPendingVerification with no staged
+//     multiset yet. Memoised against the pruning point hash.
+//
+//  2. blockHash's selected parent's stored multiset does not hash to its header's UTXOCommitment.
+//     Catches propagation when signal 1 is momentarily inconclusive, and keeps this self-scoping:
+//     once the chain reaches a block whose selected parent's multiset does agree with its header,
+//     both signals go false and full ErrBadUTXOCommitment enforcement resumes.
+//
+//  3. blockHash's selected parent IS the current pruning point. Signal 2 reads the pruning point's
+//     own multiset against its own header - the exact check verifyAndRepairImportedPruningPointUTXOSet
+//     already ran and passed at import time - so it is structurally blind to an offset that the
+//     imported set hashes correctly at the pruning point but still gets wrong one block later (see
+//     HTN-208: the import check answers "does this set hash to what the header says", not "is this
+//     set the set the network had"). This block has nothing else to inherit an offset from, so a
+//     commitment mismatch here is treated the same way. Self-scoping like the others: it only
+//     matches the one block immediately above the pruning point, and only while that pruning point
+//     is current.
+//
+// Needs no persisted marker; works on an already-synced database.
+// utxoCommitmentIsStrictFor reports whether blockHash is at or past
+// hardforks.StrictUTXOCommitmentVersion, and so may not have its UTXO checks tolerated.
+//
+// The version comes from the block's selected parent's DAA score, as this node computed it - the
+// same anchoring HTN-001/003 established for every other version-dependent rule. A block's own
+// header version is not used: it is peer-supplied, and every rule gated in the hardforks package
+// adds strictness, so a miner could otherwise opt out of this one by claiming an older version.
+//
+// A block whose selected parent has no DAA score yet (genesis, trusted-data bootstrap) falls back
+// to the process-global version, exactly as versionOfChildOf does. While the gate is unscheduled
+// that fallback cannot matter, because no version at all satisfies an unscheduled gate.
+func (csm *consensusStateManager) utxoCommitmentIsStrictFor(stagingArea *model.StagingArea,
+	blockHash *externalapi.DomainHash,
+) (bool, error) {
+	if !hardforks.IsScheduled(hardforks.StrictUTXOCommitmentVersion) {
+		return false, nil
+	}
+
+	ghostdagData, err := csm.ghostdagDataStore.Get(csm.databaseContext, stagingArea, blockHash, false)
+	if err != nil {
+		return false, err
+	}
+	blockVersion, err := csm.versionOfChildOf(stagingArea, ghostdagData.SelectedParent())
+	if err != nil {
+		return false, err
+	}
+	return hardforks.Active(hardforks.StrictUTXOCommitmentVersion, blockVersion), nil
+}
+
+func (csm *consensusStateManager) blockInheritsKnownUTXOCommitmentOffset(stagingArea *model.StagingArea,
+	blockHash *externalapi.DomainHash,
+) bool {
+	return false
+}
+
+func (csm *consensusStateManager) currentPruningPoint(stagingArea *model.StagingArea) *externalapi.DomainHash {
+	hasPruningPoint, err := csm.pruningStore.HasPruningPoint(csm.databaseContext, stagingArea)
+	if err != nil || !hasPruningPoint {
+		return nil
+	}
+	pruningPoint, err := csm.pruningStore.PruningPoint(csm.databaseContext, stagingArea)
+	if err != nil {
+		return nil
+	}
+	return pruningPoint
+}
+
+// confirmBaselineOffsetIfBoundaryBlock records that the pruning point baseline is offset once the
+// first block above it (blockHash, whose selected parent is the pruning point) has demonstrably
+// failed its own UTXO commitment check - called only from the mismatch branch of
+// validateUTXOCommitment, so the failure is already established here.
+//
+// Signal 1 in blockInheritsKnownUTXOCommitmentOffset (pruningPointBaselineIsOffset) re-hashes the
+// pruning point's own stored multiset against its own header on every call; for a set that passed
+// verifyAndRepairImportedPruningPointUTXOSet at import time, that will keep coming back "verified"
+// forever, because the offset this uncovers only becomes visible one block later. This makes it
+// visible from here on - UTXOSetHealth / IsUtxoSetVerified stop reporting the baseline as verified
+// once a descendant has demonstrated that it is not - until the pruning point advances past the one
+// recorded here. See HTN-208.
+func (csm *consensusStateManager) confirmBaselineOffsetIfBoundaryBlock(stagingArea *model.StagingArea,
+	blockHash *externalapi.DomainHash,
+) {
+	ghostdagData, err := csm.ghostdagDataStore.Get(csm.databaseContext, stagingArea, blockHash, false)
+	if err != nil {
+		return
+	}
+	selectedParent := ghostdagData.SelectedParent()
+	pruningPoint := csm.currentPruningPoint(stagingArea)
+	if selectedParent == nil || pruningPoint == nil || !selectedParent.Equal(pruningPoint) {
+		return
+	}
+	if csm.boundaryOffsetConfirmedPruningPoint != nil && csm.boundaryOffsetConfirmedPruningPoint.Equal(pruningPoint) {
+		return
+	}
+	csm.boundaryOffsetConfirmedPruningPoint = pruningPoint
+	log.Warnf("Pruning point %s: the first block above it (%s) failed its own UTXO commitment check "+
+		"although the pruning point's own stored multiset matched its own header at import time - the "+
+		"imported UTXO set is offset from the network's even though it hashed correctly there. "+
+		"Marking the UTXO baseline as unverified; IsUtxoSetVerified will report false until a clean "+
+		"pruning point is reached.", pruningPoint, blockHash)
+}
+
+// pruningPointBaselineIsOffset reports whether the current pruning point's stored per-block multiset
+// disagrees with its own header UTXOCommitment - the always-available, network-wide signal that this
+// node is running on an offset UTXO baseline. Memoised against the pruning point hash so it costs a
+// couple of LRU-cached lookups only when the pruning point advances.
+func (csm *consensusStateManager) pruningPointBaselineIsOffset(stagingArea *model.StagingArea) bool {
+	health := csm.UTXOSetHealth(stagingArea)
+	return health.Checked && !health.BaselineVerified
+}
+
+// UTXOSetHealth reports whether the pruning point's stored multiset hashes to the UTXO commitment
+// in the pruning point's own header, along with the three values that answer was derived from.
+//
+// This is the same check pruningPointBaselineIsOffset has always made - the one that decides
+// whether per-block commitment mismatches are tolerated - lifted out so it can also be reported
+// over RPC. A node that tolerates mismatches is a node whose UTXO set may disagree with the
+// network, and until this was exposed there was no way for anything outside the node to find that
+// out.
+func (csm *consensusStateManager) UTXOSetHealth(stagingArea *model.StagingArea) *externalapi.UTXOSetHealth {
+	unchecked := &externalapi.UTXOSetHealth{BaselineVerified: false, Checked: false}
+
+	hasPruningPoint, err := csm.pruningStore.HasPruningPoint(csm.databaseContext, stagingArea)
+	if err != nil || !hasPruningPoint {
+		return unchecked
+	}
+	pruningPoint, err := csm.pruningStore.PruningPoint(csm.databaseContext, stagingArea)
+	if err != nil {
+		return unchecked
+	}
+	if pruningPoint.Equal(csm.genesisHash) {
+		// Still on genesis: there is no imported baseline to be wrong about yet, so there is nothing
+		// to verify rather than something that failed verification.
+		return unchecked
+	}
+
+	pruningPointMultiset, msErr := csm.multisetStore.Get(csm.databaseContext, stagingArea, pruningPoint)
+	pruningPointHeader, headerErr := csm.blockHeaderStore.BlockHeader(csm.databaseContext, stagingArea, pruningPoint)
+	if msErr != nil || headerErr != nil {
+		return unchecked
+	}
+	storedMultiset := pruningPointMultiset.Hash()
+	headerCommitment := pruningPointHeader.UTXOCommitment()
+	verified := storedMultiset.Equal(headerCommitment)
+
+	// The pruning point's own hash can match while it is still offset from the network's true set -
+	// see confirmBaselineOffsetIfBoundaryBlock, called when the first block above the pruning point
+	// fails its own commitment check. That is a stronger signal than this recomputation, which will
+	// keep saying "verified" forever for a set that hashed correctly at import.
+	if csm.boundaryOffsetConfirmedPruningPoint != nil && csm.boundaryOffsetConfirmedPruningPoint.Equal(pruningPoint) {
+		verified = false
+	}
+
+	// The warn line fires once per pruning point, not once per call: this is on the per-block
+	// toleration path, so logging every time would drown the log.
+	if csm.baselineOffsetPruningPoint == nil || !csm.baselineOffsetPruningPoint.Equal(pruningPoint) {
+		csm.baselineOffsetPruningPoint = pruningPoint
+		csm.baselineOffset = !verified
+		if !verified {
+			log.Warnf("Pruning point %s stored multiset (%s) does not match its header UTXO commitment (%s) - "+
+				"this node is on an offset UTXO baseline; inherited per-block commitment mismatches are tolerated",
+				pruningPoint, storedMultiset, headerCommitment)
+		}
+	}
+
+	return &externalapi.UTXOSetHealth{
+		BaselineVerified: verified,
+		Checked:          true,
+		PruningPoint:     pruningPoint,
+		StoredMultiset:   storedMultiset,
+		HeaderCommitment: headerCommitment,
+	}
+}
+
+// calculateAcceptedIDMerkleRoot computes the accepted-ID merkle root of a block of the given version. The sort order
+// follows the block's own version, not the process-global one, which depends on the node's uptime and IBD.
+func calculateAcceptedIDMerkleRoot(multiblockAcceptanceData externalapi.AcceptanceData, blockVersion uint16) *externalapi.DomainHash {
+	log.Tracef("calculateAcceptedIDMerkleRoot start")
+	defer log.Tracef("calculateAcceptedIDMerkleRoot end")
+
+	var acceptedTransactions []*externalapi.DomainTransaction
+
+	for _, blockAcceptanceData := range multiblockAcceptanceData {
+		for _, transactionAcceptance := range blockAcceptanceData.TransactionAcceptanceData {
+			if !transactionAcceptance.IsAccepted {
+				continue
+			}
+			acceptedTransactions = append(acceptedTransactions, transactionAcceptance.Transaction)
+		}
+	}
+	// In block version 4 and below, the accepted transactions are sorted by their IDs, in Block Version 5 and above, the order is not important
+	if blockVersion < 5 {
+		sort.Slice(acceptedTransactions, func(i, j int) bool {
+			return consensushashing.TransactionID(acceptedTransactions[i]).Less(
+				consensushashing.TransactionID(acceptedTransactions[j]))
+		})
+	}
+
+	return merkle.CalculateIDMerkleRoot(acceptedTransactions)
+}
+
+func (csm *consensusStateManager) validateCoinbaseTransaction(stagingArea *model.StagingArea, block *externalapi.DomainBlock,
+	blockHash *externalapi.DomainHash, coinbaseTransaction *externalapi.DomainTransaction, acceptanceData externalapi.AcceptanceData,
+) error {
+	log.Tracef("validateCoinbaseTransaction start for block %s", blockHash)
+	defer log.Tracef("validateCoinbaseTransaction end for block %s", blockHash)
+
+	log.Tracef("Extracting coinbase data for coinbase transaction %s in block %s",
+		consensushashing.TransactionID(coinbaseTransaction), blockHash)
+	_, coinbaseData, _, err := csm.coinbaseManager.ExtractCoinbaseDataBlueScoreAndSubsidyForVersion(coinbaseTransaction, block.Header.Version())
+	if err != nil {
+		return err
+	}
+
+	log.Tracef("Calculating the expected coinbase transaction for the given coinbase data and block %s", blockHash)
+	// Pass the original acceptance data - ExpectedCoinbaseTransactionInternal will filter it
+	// using its own GHOSTDAG data to ensure it only processes merge set blocks
+	expectedCoinbaseTransaction, _, err := csm.coinbaseManager.ExpectedCoinbaseTransactionWithAcceptanceData(stagingArea, blockHash, coinbaseData, acceptanceData)
+	if err != nil {
+		return err
+	}
+	// Lets skip validation of the payload, because daascore or other data may change on expected payload.
+	expectedCoinbaseTransaction.Payload = coinbaseTransaction.Payload
+
+	coinbaseTransactionHash := consensushashing.TransactionHash(coinbaseTransaction)
+	expectedCoinbaseTransactionHash := consensushashing.TransactionHash(expectedCoinbaseTransaction)
+	log.Tracef("given coinbase hash: %s, expected coinbase hash: %s", coinbaseTransactionHash, expectedCoinbaseTransactionHash)
+
+	coinbaseMismatch := !coinbaseTransactionHash.Equal(expectedCoinbaseTransactionHash)
+	// Only dump the full actual-vs-expected comparison for a mismatch that isn't the already-known
+	// inherited pruning-point offset. In that regime the expected coinbase is fee-less because the
+	// fee-paying transactions spend UTXOs missing from the incomplete snapshot; verifyUTXO tolerates
+	// ErrBadCoinbaseTransaction and logs it once via logToleratedIssue, so the per-block dump would
+	// just be noise.
+	verboseCoinbaseDiff := coinbaseMismatch && !csm.blockInheritsKnownUTXOCommitmentOffset(stagingArea, blockHash)
+
+	// Debug: compare outputs in detail if hashes differ
+	if verboseCoinbaseDiff {
+		if len(coinbaseTransaction.Outputs) == len(expectedCoinbaseTransaction.Outputs) {
+			for i := range coinbaseTransaction.Outputs {
+				actOut := coinbaseTransaction.Outputs[i]
+				expOut := expectedCoinbaseTransaction.Outputs[i]
+				if actOut.Value != expOut.Value {
+					log.Infof("Output %d value differs: actual=%d, expected=%d", i, actOut.Value, expOut.Value)
+				}
+				if !bytes.Equal(actOut.ScriptPublicKey.Script, expOut.ScriptPublicKey.Script) {
+					log.Infof("Output %d script differs: actual=%x, expected=%x", i, actOut.ScriptPublicKey.Script, expOut.ScriptPublicKey.Script)
+				}
+				if actOut.ScriptPublicKey.Version != expOut.ScriptPublicKey.Version {
+					log.Infof("Output %d script version differs: actual=%d, expected=%d", i, actOut.ScriptPublicKey.Version, expOut.ScriptPublicKey.Version)
+				}
+			}
+		} else {
+			log.Infof("Output count differs: actual=%d, expected=%d", len(coinbaseTransaction.Outputs), len(expectedCoinbaseTransaction.Outputs))
+		}
+	}
+
+	if coinbaseMismatch {
+		if !verboseCoinbaseDiff {
+			return errors.Wrap(ruleerrors.ErrBadCoinbaseTransaction, "coinbase transaction is not built as expected")
+		}
+
+		log.Infof("Transaction hashes, coinbase %s != expected %s", coinbaseTransactionHash, expectedCoinbaseTransactionHash)
+
+		// Log all transaction fields for comparison
+		log.Infof("=== ACTUAL COINBASE ===")
+		log.Infof("Version: %d", coinbaseTransaction.Version)
+		log.Infof("LockTime: %d", coinbaseTransaction.LockTime)
+		log.Infof("SubnetworkID: %s", coinbaseTransaction.SubnetworkID)
+		log.Infof("Gas: %d", coinbaseTransaction.Gas)
+		log.Infof("Fee: %d", coinbaseTransaction.LoadFee())
+		log.Infof("Mass: %d", coinbaseTransaction.LoadMass())
+		log.Infof("Payload length: %d, hex: %x", len(coinbaseTransaction.Payload), coinbaseTransaction.Payload)
+		log.Infof("Inputs count: %d", len(coinbaseTransaction.Inputs))
+		for i, input := range coinbaseTransaction.Inputs {
+			log.Infof("  Input %d: Script(%x) Amount(%d)", i, input.SignatureScript, input.UTXOEntry.Amount())
+		}
+		log.Infof("Outputs count: %d", len(coinbaseTransaction.Outputs))
+		for i, output := range coinbaseTransaction.Outputs {
+			log.Infof("  Output %d: Script(%x) Value(%d)", i, output.ScriptPublicKey.Script, output.Value)
+		}
+
+		log.Infof("=== EXPECTED COINBASE ===")
+		log.Infof("Version: %d", expectedCoinbaseTransaction.Version)
+		log.Infof("LockTime: %d", expectedCoinbaseTransaction.LockTime)
+		log.Infof("SubnetworkID: %s", expectedCoinbaseTransaction.SubnetworkID)
+		log.Infof("Gas: %d", expectedCoinbaseTransaction.Gas)
+		log.Infof("Fee: %d", expectedCoinbaseTransaction.LoadFee())
+		log.Infof("Mass: %d", expectedCoinbaseTransaction.LoadMass())
+		log.Infof("Payload length: %d, hex: %x", len(expectedCoinbaseTransaction.Payload), expectedCoinbaseTransaction.Payload)
+		log.Infof("Inputs count: %d", len(expectedCoinbaseTransaction.Inputs))
+		for i, input := range expectedCoinbaseTransaction.Inputs {
+			log.Infof("  Input %d: Script(%x) Amount(%d)", i, input.SignatureScript, input.UTXOEntry.Amount())
+		}
+		log.Infof("Outputs count: %d", len(expectedCoinbaseTransaction.Outputs))
+		for i, output := range expectedCoinbaseTransaction.Outputs {
+			log.Infof("  Output %d: Script(%x) Value(%d)", i, output.ScriptPublicKey.Script, output.Value)
+		}
+
+		logMergeSetFeeBreakdown(blockHash, acceptanceData)
+
+		// Identify the specific difference
+		if coinbaseTransaction.Version != expectedCoinbaseTransaction.Version {
+			log.Infof("DIFFERENCE: Version (actual=%d, expected=%d)", coinbaseTransaction.Version, expectedCoinbaseTransaction.Version)
+		}
+		if coinbaseTransaction.LockTime != expectedCoinbaseTransaction.LockTime {
+			log.Infof("DIFFERENCE: LockTime (actual=%d, expected=%d)", coinbaseTransaction.LockTime, expectedCoinbaseTransaction.LockTime)
+		}
+		if !coinbaseTransaction.SubnetworkID.Equal(&expectedCoinbaseTransaction.SubnetworkID) {
+			log.Infof("DIFFERENCE: SubnetworkID (actual=%s, expected=%s)", coinbaseTransaction.SubnetworkID, expectedCoinbaseTransaction.SubnetworkID)
+		}
+		if coinbaseTransaction.Gas != expectedCoinbaseTransaction.Gas {
+			log.Infof("DIFFERENCE: Gas (actual=%d, expected=%d)", coinbaseTransaction.Gas, expectedCoinbaseTransaction.Gas)
+		}
+		if coinbaseTransaction.LoadFee() != expectedCoinbaseTransaction.LoadFee() {
+			log.Infof("DIFFERENCE: Fee (actual=%d, expected=%d)", coinbaseTransaction.LoadFee(), expectedCoinbaseTransaction.LoadFee())
+		}
+		if coinbaseTransaction.LoadMass() != expectedCoinbaseTransaction.LoadMass() {
+			log.Infof("DIFFERENCE: Mass (actual=%d, expected=%d)", coinbaseTransaction.LoadMass(), expectedCoinbaseTransaction.LoadMass())
+		}
+		if !bytes.Equal(coinbaseTransaction.Payload, expectedCoinbaseTransaction.Payload) {
+			log.Infof("DIFFERENCE: Payload (actual=%x, expected=%x)", coinbaseTransaction.Payload, expectedCoinbaseTransaction.Payload)
+		}
+		if len(coinbaseTransaction.Inputs) != len(expectedCoinbaseTransaction.Inputs) {
+			log.Infof("DIFFERENCE: Inputs count (actual=%d, expected=%d)", len(coinbaseTransaction.Inputs), len(expectedCoinbaseTransaction.Inputs))
+		}
+		if len(coinbaseTransaction.Outputs) != len(expectedCoinbaseTransaction.Outputs) {
+			log.Infof("DIFFERENCE: Outputs count (actual=%d, expected=%d)", len(coinbaseTransaction.Outputs), len(expectedCoinbaseTransaction.Outputs))
+
+		}
+
+		return errors.Wrap(ruleerrors.ErrBadCoinbaseTransaction, "coinbase transaction is not built as expected")
+	}
+
+	return nil
+}
+
+// maxTransactionsLoggedPerMergeSetBlock bounds the fee breakdown below. A merge set block can hold
+// hundreds of transactions and the breakdown is printed per rejected block, so the per-transaction
+// lines are capped; the per-block totals are always complete.
+const maxTransactionsLoggedPerMergeSetBlock = 16
+
+// logMergeSetFeeBreakdown prints where the fees this node expects the coinbase to pay come from.
+//
+// A coinbase mismatch that differs only in output values is a disagreement about fees, and nothing
+// else in the dump says which transactions those fees belong to, how many there are, or whether the
+// two fee numbers a block carries agree: the fee recorded in the acceptance data (what the coinbase
+// manager sums) and the fee implied by the accepted transaction's input UTXO entries (what the
+// UTXO set actually says was paid). Those two coming apart is a different defect from the miner
+// simply having counted a different set of transactions, and only this tells them apart.
+func logMergeSetFeeBreakdown(blockHash *externalapi.DomainHash, acceptanceData externalapi.AcceptanceData) {
+	log.Infof("=== MERGE SET FEE BREAKDOWN for block %s ===", blockHash)
+	for _, blockAcceptanceData := range acceptanceData {
+		var recordedTotal, impliedTotal uint64
+		accepted, logged := 0, 0
+		for _, txAcceptanceData := range blockAcceptanceData.TransactionAcceptanceData {
+			if txAcceptanceData == nil || !txAcceptanceData.IsAccepted || txAcceptanceData.Transaction == nil {
+				continue
+			}
+			// Coinbases pay no fee, and the selected parent's coinbase is accepted in every merge
+			// set, so listing them would bury the transactions that do carry fees.
+			if len(txAcceptanceData.Transaction.Inputs) == 0 {
+				continue
+			}
+			accepted++
+			impliedFee, entriesComplete := feeImpliedByInputEntries(txAcceptanceData)
+			recordedTotal += txAcceptanceData.Fee
+			impliedTotal += impliedFee
+			if txAcceptanceData.Fee == 0 && impliedFee == 0 && entriesComplete {
+				continue
+			}
+			if logged >= maxTransactionsLoggedPerMergeSetBlock {
+				continue
+			}
+			logged++
+			log.Infof("  tx %s in %s: recorded fee %d, fee implied by input entries %d, %d inputs, "+
+				"%d input entries, entries complete: %t",
+				consensushashing.TransactionID(txAcceptanceData.Transaction), blockAcceptanceData.BlockHash,
+				txAcceptanceData.Fee, impliedFee, len(txAcceptanceData.Transaction.Inputs),
+				len(txAcceptanceData.TransactionInputUTXOEntries), entriesComplete)
+		}
+		log.Infof("  merge set block %s: %d accepted transactions with inputs, recorded fee total %d, "+
+			"implied fee total %d", blockAcceptanceData.BlockHash, accepted, recordedTotal, impliedTotal)
+	}
+}
+
+// feeImpliedByInputEntries is what the accepted transaction's own input UTXO entries say it paid.
+// entriesComplete reports whether there was one non-nil entry per input; when there was not, the
+// returned fee is meaningless and only says that this record cannot answer the question.
+func feeImpliedByInputEntries(txAcceptanceData *externalapi.TransactionAcceptanceData) (fee uint64, entriesComplete bool) {
+	transaction := txAcceptanceData.Transaction
+	if len(txAcceptanceData.TransactionInputUTXOEntries) != len(transaction.Inputs) {
+		return 0, false
+	}
+	var totalIn uint64
+	for _, entry := range txAcceptanceData.TransactionInputUTXOEntries {
+		if entry == nil {
+			return 0, false
+		}
+		totalIn += entry.Amount()
+	}
+	var totalOut uint64
+	for _, output := range transaction.Outputs {
+		totalOut += output.Value
+	}
+	if totalIn < totalOut {
+		return 0, true
+	}
+	return totalIn - totalOut, true
+}
+
+// filterAcceptanceDataByMergeSet filters the acceptance data to only include blocks
+// that are in the GHOSTDAG merge set (blues and reds). This ensures the expected coinbase
+// is generated using the same set of blocks that were used to create the real coinbase.
+func filterAcceptanceDataByMergeSet(acceptanceData externalapi.AcceptanceData, ghostdagData *externalapi.BlockGHOSTDAGData) externalapi.AcceptanceData {
+	// Build a set of block hashes that are in the merge set
+	mergeSetHashes := make(map[string]bool)
+	for _, blockHash := range ghostdagData.MergeSetBlues() {
+		mergeSetHashes[blockHash.String()] = true
+	}
+	for _, blockHash := range ghostdagData.MergeSetReds() {
+		mergeSetHashes[blockHash.String()] = true
+	}
+
+	// Filter the acceptance data to only include blocks in the merge set
+	filteredData := make(externalapi.AcceptanceData, 0, len(acceptanceData))
+	for _, blockAcceptance := range acceptanceData {
+		if blockAcceptance.BlockHash != nil {
+			if mergeSetHashes[blockAcceptance.BlockHash.String()] {
+				filteredData = append(filteredData, blockAcceptance)
+			}
+		}
+	}
+
+	return filteredData
+}

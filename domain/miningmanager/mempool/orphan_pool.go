@@ -1,0 +1,430 @@
+package mempool
+
+import (
+	"fmt"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/constants"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/ruleerrors"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/utils/consensushashing"
+
+	"github.com/HoosatNetwork/HTND/v2/domain/consensus/model/externalapi"
+	"github.com/HoosatNetwork/HTND/v2/domain/miningmanager/mempool/model"
+	"github.com/pkg/errors"
+)
+
+type (
+	idToOrphanMap               map[externalapi.DomainTransactionID]*model.OrphanTransaction
+	previousOutpointToOrphanMap map[externalapi.DomainOutpoint]*model.OrphanTransaction
+)
+
+type orphansPool struct {
+	mempool                   *mempool
+	allOrphans                idToOrphanMap
+	orphansByPreviousOutpoint previousOutpointToOrphanMap
+	lastExpireScan            uint64
+}
+
+func newOrphansPool(mp *mempool) *orphansPool {
+	return &orphansPool{
+		mempool:                   mp,
+		allOrphans:                idToOrphanMap{},
+		orphansByPreviousOutpoint: previousOutpointToOrphanMap{},
+		lastExpireScan:            0,
+	}
+}
+
+func (op *orphansPool) maybeAddOrphan(transaction *externalapi.DomainTransaction, isHighPriority bool,
+	isLocalSubmission bool,
+) error {
+	if op.mempool.config.MaximumOrphanTransactionCount == 0 {
+		return nil
+	}
+
+	err := op.checkOrphanDuplicate(transaction)
+	if err != nil {
+		return err
+	}
+
+	err = op.checkOrphanMass(transaction)
+	if err != nil {
+		return err
+	}
+	err = op.checkOrphanDoubleSpend(transaction)
+	if err != nil {
+		return err
+	}
+
+	err = op.addOrphan(transaction, isHighPriority, isLocalSubmission)
+	if err != nil {
+		return err
+	}
+
+	err = op.limitOrphanPoolSize()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (op *orphansPool) limitOrphanPoolSize() error {
+	for uint64(len(op.allOrphans)) > op.mempool.config.MaximumOrphanTransactionCount {
+		orphanToRemove := op.randomEvictableOrphan()
+		if orphanToRemove == nil { // this means all orphans are locally submitted high-priority ones
+			log.Warnf(
+				"Number of locally submitted high-priority transactions in orphanPool (%d) is higher than maximum allowed (%d)",
+				len(op.allOrphans),
+				op.mempool.config.MaximumOrphanTransactionCount)
+			break
+		}
+
+		// Don't remove redeemers in the case of a random eviction since the evicted transaction is
+		// not invalid, therefore it's redeemers are as good as any orphan that just arrived.
+		err := op.removeOrphan(orphanToRemove.TransactionID(), false)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (op *orphansPool) checkOrphanMass(transaction *externalapi.DomainTransaction) error {
+	if transaction.LoadMass() > op.mempool.config.MaximumOrphanTransactionMass {
+		str := fmt.Sprintf("orphan transaction size of %d bytes is "+
+			"larger than max allowed size of %d bytes",
+			transaction.LoadMass(), op.mempool.config.MaximumOrphanTransactionMass)
+		return transactionRuleError(RejectBadOrphan, str)
+	}
+	return nil
+}
+
+func (op *orphansPool) checkOrphanDuplicate(transaction *externalapi.DomainTransaction) error {
+	if _, ok := op.allOrphans[*consensushashing.TransactionID(transaction)]; ok {
+		str := fmt.Sprintf("Orphan transacion %s is already in the orphan pool",
+			consensushashing.TransactionID(transaction))
+		return transactionRuleError(RejectDuplicate, str)
+	}
+	return nil
+}
+
+func (op *orphansPool) checkOrphanDoubleSpend(transaction *externalapi.DomainTransaction) error {
+	for _, input := range transaction.Inputs {
+		if doubleSpendOrphan, ok := op.orphansByPreviousOutpoint[input.PreviousOutpoint]; ok {
+			str := fmt.Sprintf("Orphan transacion %s is double spending an input from already existing orphan %s",
+				consensushashing.TransactionID(transaction), doubleSpendOrphan.TransactionID())
+			return transactionRuleError(RejectDuplicate, str)
+		}
+	}
+
+	return nil
+}
+
+func (op *orphansPool) addOrphan(transaction *externalapi.DomainTransaction, isHighPriority bool,
+	isLocalSubmission bool,
+) error {
+	virtualDAAScore, err := op.mempool.consensusReference.Consensus().GetVirtualDAAScore()
+	if err != nil {
+		return err
+	}
+	orphanTransaction := model.NewOrphanTransaction(transaction, isHighPriority, isLocalSubmission, virtualDAAScore)
+
+	op.allOrphans[*orphanTransaction.TransactionID()] = orphanTransaction
+	for _, input := range transaction.Inputs {
+		op.orphansByPreviousOutpoint[input.PreviousOutpoint] = orphanTransaction
+	}
+
+	return nil
+}
+
+func (op *orphansPool) processOrphansAfterAcceptedTransaction(acceptedTransaction *externalapi.DomainTransaction) (
+	acceptedOrphans []*externalapi.DomainTransaction, err error,
+) {
+	acceptedOrphans = []*externalapi.DomainTransaction{}
+	queue := []*externalapi.DomainTransaction{acceptedTransaction}
+
+	for len(queue) > 0 {
+		var current *externalapi.DomainTransaction
+		current, queue = queue[0], queue[1:]
+
+		currentTransactionID := consensushashing.TransactionID(current)
+		outpoint := externalapi.DomainOutpoint{TransactionID: *currentTransactionID}
+		for i := range current.Outputs {
+			outpoint.Index = checkedOutpointIndex(i)
+			orphan, ok := op.orphansByPreviousOutpoint[outpoint]
+			if !ok {
+				continue
+			}
+			// Promote only when every input is an output a UTXO-valid block has accepted into
+			// virtual. A parent that is merely in the mempool, or in a block that was not
+			// UTXO-valid, does not make its outputs spendable.
+			for _, input := range orphan.Transaction().Inputs {
+				if input.UTXOEntry != nil && input.UTXOEntry.BlockDAAScore() == constants.UnacceptedDAAScore {
+					input.UTXOEntry = nil
+				}
+			}
+			_, missing, err := op.mempool.fillInputsAndGetMissingParents(orphan.Transaction())
+			if err != nil {
+				if errors.As(err, &RuleError{}) {
+					log.Infof("Failed to unorphan transaction %s due to rule error: %s",
+						currentTransactionID, err)
+					continue
+				}
+				return nil, err
+			}
+			if len(missing) > 0 {
+				continue
+			}
+			err = op.unorphanTransaction(orphan)
+			if err != nil {
+				if errors.As(err, &RuleError{}) {
+					log.Infof("Failed to unorphan transaction %s due to rule error: %s",
+						currentTransactionID, err)
+					continue
+				}
+				return nil, err
+			}
+			acceptedOrphans = append(acceptedOrphans, orphan.Transaction().Clone()) // these pointers leave the mempool, hence the clone
+			// The promoted transaction may itself be the missing parent of further orphans,
+			// once its outputs are in the UTXO set of a UTXO-valid block.
+			queue = append(queue, orphan.Transaction())
+		}
+	}
+
+	return acceptedOrphans, nil
+}
+
+func (op *orphansPool) unorphanTransaction(transaction *model.OrphanTransaction) error {
+	err := op.removeOrphan(transaction.TransactionID(), false)
+	if err != nil {
+		return err
+	}
+
+	// A transaction spending one of this orphan's inputs may have entered the pool while it waited:
+	// the pool's double-spend check only runs for arriving transactions, and the orphan pool only
+	// compares orphans with each other. Promoting it anyway put two pool transactions on the same
+	// outpoint and overwrote the pool's record of who spends it.
+	err = op.mempool.mempoolUTXOSet.checkDoubleSpends(transaction.Transaction())
+	if err != nil {
+		return err
+	}
+
+	err = op.mempool.consensusReference.Consensus().ValidateTransactionAndPopulateWithConsensusData(transaction.Transaction())
+	if err != nil {
+		if errors.Is(err, ruleerrors.ErrImmatureSpend) {
+			return transactionRuleError(RejectImmatureSpend, "one of the transaction inputs spends an immature UTXO")
+		}
+		if errors.As(err, &ruleerrors.RuleError{}) {
+			return newRuleError(err)
+		}
+		return err
+	}
+
+	err = op.mempool.validateTransactionInContext(transaction.Transaction(), transaction.IsLocalSubmission())
+	if err != nil {
+		return err
+	}
+
+	virtualDAAScore, err := op.mempool.consensusReference.Consensus().GetVirtualDAAScore()
+	if err != nil {
+		return err
+	}
+	// Carry the priority the orphan already earned at admission (raisePriorityIfCompound runs before
+	// maybeAddOrphan - see validateAndInsertTransaction) into the promoted mempool transaction.
+	// Discarding it here (as this used to, always passing false) meant a compound transaction that
+	// arrived before its parents was protected only while it waited in the orphan pool and lost that
+	// protection the moment its parents showed up and it was promoted - exactly the gap 78fcbddaf's
+	// keep-alive was meant to close.
+	mempoolTransaction := model.NewMempoolTransaction(
+		transaction.Transaction(),
+		op.mempool.transactionsPool.getParentTransactionsInPool(transaction.Transaction()),
+		transaction.IsHighPriority(),
+		virtualDAAScore,
+	)
+	err = op.mempool.transactionsPool.addMempoolTransaction(mempoolTransaction)
+	if err != nil {
+		return err
+	}
+
+	// Record this transaction for compound rate limiting using the original orphan arrival time.
+	// Only for orphans this node's own RPC submitted - a relayed orphan must not consume the local
+	// submission budget, or every node ends up throttling the network's traffic against its own quota.
+	if transaction.IsLocalSubmission() {
+		txID := consensushashing.TransactionID(transaction.Transaction())
+		op.mempool.compoundTxRateLimiter.recordTransactionAt(transaction.Transaction(), txID.String(), transaction.AddedAtTime())
+	}
+
+	return nil
+}
+
+func (op *orphansPool) removeOrphan(orphanTransactionID *externalapi.DomainTransactionID, removeRedeemers bool) error {
+	orphanTransaction, ok := op.allOrphans[*orphanTransactionID]
+	if !ok {
+		return nil
+	}
+
+	delete(op.allOrphans, *orphanTransactionID)
+
+	for i, input := range orphanTransaction.Transaction().Inputs {
+		if _, ok := op.orphansByPreviousOutpoint[input.PreviousOutpoint]; !ok {
+			return errors.Errorf("Input No. %d of %s (%s) doesn't exist in orphansByPreviousOutpoint",
+				i, orphanTransactionID, input.PreviousOutpoint)
+		}
+		delete(op.orphansByPreviousOutpoint, input.PreviousOutpoint)
+	}
+
+	if removeRedeemers {
+		err := op.removeRedeemersOf(orphanTransaction)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (op *orphansPool) removeRedeemersOf(transaction model.Transaction) error {
+	outpoint := externalapi.DomainOutpoint{TransactionID: *transaction.TransactionID()}
+	for i := range transaction.Transaction().Outputs {
+		outpoint.Index = checkedOutpointIndex(i)
+		if orphan, ok := op.orphansByPreviousOutpoint[outpoint]; ok {
+			// Recursive call is bound by size of orphan pool (which is very small)
+			err := op.removeOrphan(orphan.TransactionID(), true)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (op *orphansPool) expireOrphanTransactions() error {
+	virtualDAAScore, err := op.mempool.consensusReference.Consensus().GetVirtualDAAScore()
+	if err != nil {
+		return err
+	}
+
+	if virtualDAAScore-op.lastExpireScan < op.mempool.config.orphanExpireScanIntervalDAAScore() {
+		return nil
+	}
+
+	for _, orphanTransaction := range op.allOrphans {
+		// Never expire locally submitted high priority transactions
+		if isProtectedOrphan(orphanTransaction) {
+			continue
+		}
+
+		// Remove all transactions whose addedAtDAAScore is older then TransactionExpireIntervalDAAScore
+		if virtualDAAScore-orphanTransaction.AddedAtDAAScore() > op.mempool.config.orphanExpireIntervalDAAScore() {
+			err = op.removeOrphan(orphanTransaction.TransactionID(), false)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	op.lastExpireScan = virtualDAAScore
+	return nil
+}
+
+func (op *orphansPool) updateOrphansAfterTransactionRemoved(
+	removedTransaction *model.MempoolTransaction, removeRedeemers bool,
+) error {
+	if removeRedeemers {
+		return op.removeRedeemersOf(removedTransaction)
+	}
+
+	outpoint := externalapi.DomainOutpoint{TransactionID: *removedTransaction.TransactionID()}
+	for i := range removedTransaction.Transaction().Outputs {
+		outpoint.Index = checkedOutpointIndex(i)
+		if orphan, ok := op.orphansByPreviousOutpoint[outpoint]; ok {
+			for _, input := range orphan.Transaction().Inputs {
+				if input.PreviousOutpoint.TransactionID.Equal(removedTransaction.TransactionID()) {
+					input.UTXOEntry = nil
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// isProtectedOrphan reports whether an orphan is exempt from eviction and expiry: a high-priority orphan
+// that this node's own RPC submitted. A relayed orphan is never exempt, whatever its priority.
+//
+// Relayed compound transactions are raised to high priority so that the transaction pool keeps them until
+// they are mined (see raisePriorityIfCompound). In the orphan pool the same exemption let any peer add
+// orphans the pool could neither evict nor expire: a relayed compound whose parents never arrived stayed
+// forever, and the pool grew far past MaximumOrphanTransactionCount. isLocalSubmission is what scopes the
+// exemption back down to this node's own submissions here. unorphanTransaction carries an orphan's
+// priority into its promoted mempool transaction, so once the parents do arrive the same priority this
+// function saw continues to apply there too - see its own comment for why that used to be dropped.
+func isProtectedOrphan(orphan *model.OrphanTransaction) bool {
+	return orphan.IsHighPriority() && orphan.IsLocalSubmission()
+}
+
+func (op *orphansPool) randomEvictableOrphan() *model.OrphanTransaction {
+	for _, orphan := range op.allOrphans {
+		if !isProtectedOrphan(orphan) {
+			return orphan
+		}
+	}
+
+	return nil
+}
+
+func (op *orphansPool) getOrphanTransaction(transactionID *externalapi.DomainTransactionID, clone bool) (*externalapi.DomainTransaction, bool) {
+	if orphanTransaction, ok := op.allOrphans[*transactionID]; ok {
+		transaction := orphanTransaction.Transaction()
+		if clone {
+			transaction = transaction.Clone() // this pointer leaves the mempool, hence we clone.
+		}
+		return transaction, true
+	}
+	return nil, false
+}
+
+func (op *orphansPool) getOrphanTransactionsByAddresses(clone bool) (
+	sending model.ScriptPublicKeyStringToDomainTransactions,
+	receiving model.ScriptPublicKeyStringToDomainTransactions,
+	err error,
+) {
+	sending = make(model.ScriptPublicKeyStringToDomainTransactions)
+	receiving = make(model.ScriptPublicKeyStringToDomainTransactions, op.orphanTransactionCount())
+	var transaction *externalapi.DomainTransaction
+	for _, mempoolTransaction := range op.allOrphans {
+		transaction = mempoolTransaction.Transaction()
+		if clone {
+			transaction = transaction.Clone() // these pointers leave the mempool, hence we clone.
+		}
+		for _, input := range transaction.Inputs {
+			if input.UTXOEntry == nil { // this is not a bug, but a valid state of orphan transactions with missing outpoints.
+				continue
+			}
+
+			sending.Add(input.UTXOEntry.ScriptPublicKey().String(), transaction)
+		}
+		for _, output := range transaction.Outputs {
+			receiving.Add(output.ScriptPublicKey.String(), transaction)
+		}
+	}
+	return sending, receiving, nil
+}
+
+func (op *orphansPool) getAllOrphanTransactions(clone bool) []*externalapi.DomainTransaction {
+	allOrphanTransactions := make([]*externalapi.DomainTransaction, len(op.allOrphans))
+	i := 0
+	for _, mempoolTransaction := range op.allOrphans {
+		allOrphanTransactions[i] = mempoolTransaction.Transaction()
+		if clone {
+			allOrphanTransactions[i] = allOrphanTransactions[i].Clone() // these pointers leave the mempool, hence we clone.
+		}
+		i++
+	}
+	return allOrphanTransactions
+}
+
+func (op *orphansPool) orphanTransactionCount() int {
+	return len(op.allOrphans)
+}
