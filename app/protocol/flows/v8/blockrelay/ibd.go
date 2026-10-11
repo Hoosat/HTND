@@ -98,6 +98,21 @@ func (flow *handleIBDFlow) updateBlockVersionFromDAAScore(daaScore uint64) {
 }
 
 func (flow *handleIBDFlow) runIBDIfNotRunning(block *externalapi.DomainBlock) error {
+	// Evaluate the headers-proof refuse before the IBD flag is set.
+	// The candidate is a peer whose blue score is past pruning depth.
+	// A live, mature node declines that IBD without entering it.
+	// Other IBD paths are unchanged. Block relay is unchanged.
+	if more, err := flow.checkIfHighHashHasMoreBlueWorkThanSelectedTipAndPruningDepthMoreBlueScore(block); err != nil {
+		return err
+	} else if more {
+		if live, err := flow.localChainIsLive(); err != nil {
+			return err
+		} else if live && processIsMature() {
+			log.Infof("not starting IBD from %s: local chain is live", flow.peer)
+			return nil
+		}
+	}
+
 	isNearlySynced, errNs := flow.Domain().Consensus().IsNearlySynced()
 	if errNs != nil {
 		isNearlySynced = false // If we can't tell, err on the side of caution

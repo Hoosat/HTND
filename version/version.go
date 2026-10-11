@@ -30,7 +30,7 @@ const shortCommitLength = 9
 // git binary available, so it cannot be looked up on startup.
 var appBuild = "cryptonoob-rc"
 
-const stampedVersion = "2.19-cryptonoob-rc"
+const stampedVersion = "2.19.0.1"
 
 var version = "" // string used for memoization of version
 
